@@ -91,9 +91,13 @@ function buildWhere(where: Record<string, any> | undefined, startIdx = 1) {
         }
         if (op.contains !== undefined) { parts.push(`"${col}"::text ILIKE $${idx++}`); values.push(`%${op.contains}%`) }
         if (op.in !== undefined && Array.isArray(op.in)) {
-          const placeholders = op.in.map(() => `$${idx++}`).join(', ')
-          parts.push(`"${col}" IN (${placeholders})`)
-          values.push(...op.in)
+          if (op.in.length === 0) {
+            parts.push(`1=0`)
+          } else {
+            const placeholders = op.in.map(() => `$${idx++}`).join(', ')
+            parts.push(`"${col}" IN (${placeholders})`)
+            values.push(...op.in)
+          }
         }
       } else {
         parts.push(`"${col}" = $${idx++}`)
@@ -345,7 +349,7 @@ router.post('/:projectId/database/delete', asyncRoute(v1AuthMiddleware), asyncRo
       return
     }
 
-    const sql = `DELETE FROM "${schemaName}"."${tableName}" ${whereClause} RETURNING id`
+    const sql = `DELETE FROM "${schemaName}"."${tableName}" ${whereClause} RETURNING *`
     const rls = await resolveRlsIdentity(req, ctx.projectId, ctx.apiKey.serviceRole)
     const result = await executeWithUserContext<any>(rls.userId, rls.isServiceRole, sql, values, rls.role)
 
