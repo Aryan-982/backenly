@@ -13,6 +13,13 @@ const QUESTION_OPENERS = new Set([
   'can', 'does', 'do', 'is', 'are', 'should', 'could', 'would', 'will',
 ])
 
+const GENUINE_QUESTION_OPENERS = new Set([
+  'what', 'how', 'why', 'who', 'when', 'where',
+  'is', 'are', 'does', 'do', 'should',
+])
+
+const POLITE_BUILD_REQUEST_OPENERS = new Set(['can', 'could', 'would', 'will'])
+
 /**
  * Does this message read like a description of an app/product to build?
  *
@@ -34,7 +41,8 @@ export function looksLikeBuildDescription(message: string): boolean {
   // this work?") is a CHAT/QUESTION the classifier normally catches; if it
   // still landed here, it is not a build description.
   const firstWord = words[0].toLowerCase().replace(/[^a-z]/g, '')
-  if (text.length < 60 && (text.endsWith('?') || QUESTION_OPENERS.has(firstWord))) return false
+  if (text.endsWith('?') && GENUINE_QUESTION_OPENERS.has(firstWord)) return false
+  if (text.length < 60 && QUESTION_OPENERS.has(firstWord) && !POLITE_BUILD_REQUEST_OPENERS.has(firstWord)) return false
 
   // Anything else on a fresh project that is a real sentence is worth handing
   // to the architect — it decides buildable vs genuinely-vague, not us.

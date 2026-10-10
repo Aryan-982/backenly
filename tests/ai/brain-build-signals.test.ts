@@ -70,3 +70,29 @@ describe('looksLikeBuildDescription — a long, imperative-free description stil
     ).toBe(true)
   })
 })
+
+describe('looksLikeBuildDescription — rejects genuine questions even when lengthy', () => {
+  const longQuestions = [
+    'How do I add authentication to my app so users can sign in with Google?',
+    'What is the difference between owner_read_write and participants RLS templates?',
+    'Why should my app store user session data in Redis instead of Postgres?',
+    'Who is responsible for handling billing retries when Stripe webhooks fail?',
+    'When should I rotate API keys for a multi-tenant SaaS app?',
+    'Where should I put the webhook verification secret for my integration?',
+    'Is it safe to expose read-only metrics from the admin service?',
+    'Are there any performance tradeoffs to using row-level security for this schema?',
+    'Does this API support per-user rate limits across a shared backend?',
+    'Do I need to rewrite the API gateway for a multi-region rollout?',
+    'Should I split the order service for better write throughput and isolation?',
+  ]
+
+  it.each(longQuestions)('rejects long questions: %s', (msg) => {
+    expect(looksLikeBuildDescription(msg)).toBe(false)
+  })
+
+  it('keeps polite build requests eligible even when they are phrased as questions', () => {
+    expect(
+      looksLikeBuildDescription('Can you build me a recipe app where users share photos, save favorites, and follow other cooks?'),
+    ).toBe(true)
+  })
+})
