@@ -73,11 +73,13 @@ const publicPathPrefixes = [
   '/comparisons',
   '/features',
   '/use-cases',
-  '/resources',
   '/docs',
+  '/resources',     // the docs moved to /docs and next.config redirects every
+                    // /resources URL there; the prefix stays public so an auth
+                    // wall can never win the race
   '/mcp',           // the page is gone and next.config redirects it, but the
                     // prefix stays public so an auth wall can never win the race
-  '/quickstart',    // same: the page was deleted and 301s to /resources. The
+  '/quickstart',    // same: the page was deleted and 301s to /docs/connect. The
                     // prefix stays public so the redirect always resolves for
                     // anonymous visitors following an indexed or npm link
   '/report/',       // shared change reports — access IS the revocable token, no session
@@ -111,13 +113,22 @@ const marketingPrefixes = [
   '/comparisons',
   '/features',
   '/use-cases',
+  '/docs',
   '/resources',
   '/mcp',
   '/quickstart',
   '/startups',
 ]
 
+// Served under a marketing prefix but not marketing. The published CLI and
+// older MCP setup prompts fetch /docs/llms.txt (rewritten to /llms.txt in
+// next.config.js), and an agent on a self-hosted install needs that answered
+// rather than bounced to /app. Middleware runs before rewrites, so the
+// exemption has to be by path here.
+const marketingExemptions = ['/docs/llms.txt']
+
 function isMarketingPath(pathname: string): boolean {
+  if (marketingExemptions.includes(pathname)) return false
   if (marketingRoutes.includes(pathname)) return true
   return marketingPrefixes.some(prefix => pathname === prefix || pathname.startsWith(prefix + '/'))
 }

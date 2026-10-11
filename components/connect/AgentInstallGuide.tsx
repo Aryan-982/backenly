@@ -48,12 +48,13 @@ import { AGENT_ICON, GenericAgentIcon } from './AgentBrandIcons'
 import { CodeSurface, CliText, JsonText } from './CodeSurface'
 
 /**
- * /resources is written for a person, so every link a human clicks in this UI
- * points there. llms.txt is written for a model and is never linked from here:
- * sending a developer to a plaintext dump addressed to their agent is a dead
- * end. (Was /quickstart until that page was removed; it now 301s here anyway.)
+ * /docs is written for a person, so every link a human clicks in this UI points
+ * there, at the page for this section. llms.txt is written for a model and is
+ * never linked from here: sending a developer to a plaintext dump addressed to
+ * their agent is a dead end. (Was /quickstart, then /resources; both now
+ * redirect into /docs.)
  */
-const USER_DOCS = '/resources'
+const USER_DOCS = '/docs/connect'
 const KEY_PLACEHOLDER = '<SCOPED_KEY>'
 /** The remote (Streamable-HTTP) MCP endpoint — app/api/mcp/route.ts. No npx. */
 const REMOTE_URL = 'https://backenly.com/api/mcp'
