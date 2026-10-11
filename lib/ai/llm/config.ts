@@ -43,7 +43,9 @@ const ROUTES: Record<AiPurpose, Omit<PurposeRoute, 'model'>> = {
   // investigation could not conclude. The investigator proper is autonomy.investigate.
   'autonomy.diagnose':    { thinking: false, effort: 'medium', maxTokens: 4096,  timeoutMs: 90_000 },
   'autonomy.investigate': { thinking: true,  effort: 'max',    maxTokens: 32000, timeoutMs: 300_000 },
+  // The public /v1/{projectId}/ai/generate endpoint: `default` and `fast`.
   'runtime.generate':     { thinking: false, effort: 'medium', maxTokens: 4096,  timeoutMs: 60_000 },
+  'runtime.fast':         { thinking: false, effort: 'low',    maxTokens: 4096,  timeoutMs: 30_000 },
 }
 
 export const ALL_PURPOSES = Object.keys(ROUTES) as AiPurpose[]
@@ -104,6 +106,7 @@ function openaiDefault(purpose: AiPurpose, env: Env): string {
     case 'brain.classify':
     case 'brain.summary':
     case 'build.classify':
+    case 'runtime.fast':
       return set(env.OPENAI_MODEL_FAST) ?? 'gpt-4o-mini'
     case 'build.fix_author':
       return set(env.AUTONOMY_FIX_MODEL) ?? 'gpt-4o'

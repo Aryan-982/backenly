@@ -27,6 +27,7 @@ export type AiPurpose =
   | 'autonomy.diagnose'
   | 'autonomy.investigate'
   | 'runtime.generate'
+  | 'runtime.fast'
 
 /** The effort levels every routed model accepts. Opus 4.6 has no `xhigh`. */
 export type Effort = 'low' | 'medium' | 'high' | 'max'
