@@ -110,6 +110,21 @@ export async function createApprovalRequest(input: {
   return row
 }
 
+/**
+ * Every status a request can carry. `approved` is the moment between the claim
+ * and the outcome. `partial` is no longer written: it came from the replay path
+ * that approval replaced, when one approval could run several changes. Older
+ * rows still carry it, and check_approval reports a row as it was stored.
+ */
+export type ApprovalStatus =
+  | 'pending'
+  | 'approved'
+  | 'executed'
+  | 'rejected'
+  | 'expired'
+  | 'failed'
+  | 'partial'
+
 /** Lazily expire on read — no cron needed for correctness. */
 function effectiveStatus(row: { status: string; expiresAt: Date }): string {
   if (row.status === 'pending' && row.expiresAt < new Date()) return 'expired'
@@ -298,7 +313,14 @@ export async function runApprovedCall(
           `Nothing was applied. Raise the request again once whatever it asks for is in place.`,
       }
     }
-    return { status: 'failed', summary: `${result.summary}\n\nThe approved call reported failure; nothing was applied.` }
+    // Not "nothing was applied": a deploy, a merge or a data migration can stop
+    // part-way, and nothing here can tell which of its steps took effect.
+    return {
+      status: 'failed',
+      summary:
+        `${result.summary}\n\nThe approved call reported failure. Whether any part of it took effect ` +
+        `is not known here, so read the current state before raising it again.`,
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     return { status: 'failed', summary: `${message}\n\nThe approved call did not complete. Read the current state before asking again.` }
