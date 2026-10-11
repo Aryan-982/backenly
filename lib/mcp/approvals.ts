@@ -1,30 +1,35 @@
 /**
- * MCP approval escalation — destructive ops become approvable requests
+ * MCP approval escalation — gated calls become approvable requests
  * instead of flat refusals.
  *
  * Flow:
- *   1. backend_chat over MCP hits the brain's destructive gate → the run ends
- *      blocked. The chat route calls `createApprovalRequest` with the danger
- *      details, and the agent receives { approval: { id, status: 'pending' } }.
+ *   1. A call that needs a human (`needsApproval`: destructive, or an executor
+ *      rated high-risk) is stopped before it runs — by the brain's gate under
+ *      backend_chat, or by the MCP tool route for a typed call. The caller
+ *      records it with `createApprovalRequest`: the exact tool and the exact
+ *      arguments. The agent receives { approval: { id, status: 'pending' } }.
  *   2. The human sees the request in the Review Queue (dashboard) and
  *      approves or rejects it.
- *   3. Approval re-runs the ORIGINAL message through the brain with
- *      destructiveConfirmed=true — the same resume path the dashboard chat
- *      uses — and records the outcome on the request row.
+ *   3. Approval runs THAT call verbatim (`runApprovedCall`) — no model, no
+ *      re-reading of the request text — and records the outcome on the row.
  *   4. The agent polls the `check_approval` MCP tool until status is
  *      executed / rejected / failed / expired.
  *
  * Safety invariants:
  *   • Approval authority is platform-JWT only (withProjectAccess) — a scoped
  *     agent key can create and poll requests but can NEVER decide one.
+ *   • What executes is exactly what the human read: the recorded tool and
+ *     arguments, never a re-interpretation of the request text. A request
+ *     without an exact call cannot be executed at all: approving one closes
+ *     it, unrun, with the reason.
  *   • Requests expire (default 24h). Expired requests cannot be approved.
+ *   • A request executes at most once (atomic pending → approved claim).
  *   • Execution happens server-side at decision time, by the approver's
  *     identity, with the standard audit trail.
  */
 
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db/prisma'
-import { runBrain, type BrainEvent } from '@/lib/ai/brain/agent'
 import { dispatchTool, type ToolDispatchContext, type ToolResult } from '@/lib/ai/brain/tools'
 
 export const APPROVAL_TTL_MS = 24 * 60 * 60 * 1000
@@ -64,11 +69,11 @@ export async function createApprovalRequest(input: {
   message: string
   danger: DangerInfo
   /**
-   * The exact arguments for `danger.tool`. When present, approval runs that
-   * call verbatim instead of replaying `message` through the brain, so what
-   * executes is what the human read. MCP domain tools always set it.
+   * The exact arguments for `danger.tool`. Approval runs this call verbatim,
+   * so what executes is what the human read. Required: a request that cannot
+   * name its exact call cannot be approved safely, so it must not be created.
    */
-  toolArgs?: Record<string, unknown>
+  toolArgs: Record<string, unknown>
 }) {
   const row = await prisma.agentApprovalRequest.create({
     data: {
@@ -80,7 +85,7 @@ export async function createApprovalRequest(input: {
       target: input.danger.target.slice(0, 300),
       rowCount: input.danger.rowCount,
       reversible: input.danger.reversible,
-      ...(input.toolArgs ? { toolArgs: input.toolArgs as Prisma.InputJsonValue } : {}),
+      toolArgs: input.toolArgs as Prisma.InputJsonValue,
       expiresAt: new Date(Date.now() + APPROVAL_TTL_MS),
     },
   })
@@ -171,8 +176,36 @@ export async function decideApproval(input: {
       where: { id: row.id },
       data: { status: 'rejected', decidedBy: input.approverUserId, decidedAt: new Date() },
     })
-    await auditDecision(input, row.tool, row.target, 'rejected')
+    await auditDecision(input, row.tool, row.target, 'AGENT_APPROVAL_REJECTED')
     return { ok: true, status: 'rejected' }
+  }
+
+  // A request that does not name its exact call cannot be executed safely:
+  // the only thing left to run would be the request's MESSAGE, and replaying a
+  // message runs whatever the model chooses, not the operation the human read.
+  // Such rows predate exact-call approvals. Close them, unrun, and say why.
+  const exactArgs = row.toolArgs
+  const isExact = !!exactArgs && typeof exactArgs === 'object' && !Array.isArray(exactArgs)
+  if (!isExact) {
+    const summary =
+      'Not executed. This request was raised before approvals were bound to one exact operation, ' +
+      'so approving it could not guarantee that what ran is what you read. Nothing was changed. ' +
+      'Ask the agent to request the operation again; the new request will carry the exact call.'
+    const closed = await prisma.agentApprovalRequest.updateMany({
+      where: { id: row.id, status: 'pending' },
+      data: {
+        status: 'failed',
+        decidedBy: input.approverUserId,
+        decidedAt: new Date(),
+        resultSummary: summary,
+      },
+    })
+    if (closed.count === 0) {
+      const fresh = await prisma.agentApprovalRequest.findUnique({ where: { id: row.id } })
+      return { ok: false, status: fresh?.status ?? 'unknown', error: 'Already decided elsewhere' }
+    }
+    await auditDecision(input, row.tool, row.target, 'AGENT_APPROVAL_UNBOUND_REFUSED')
+    return { ok: false, status: 'failed', resultSummary: summary }
   }
 
   // Claim atomically so a double-click / second tab cannot execute twice.
@@ -184,166 +217,42 @@ export async function decideApproval(input: {
     const fresh = await prisma.agentApprovalRequest.findUnique({ where: { id: row.id } })
     return { ok: false, status: fresh?.status ?? 'unknown', error: 'Already decided elsewhere' }
   }
-  await auditDecision(input, row.tool, row.target, 'approved')
+  await auditDecision(input, row.tool, row.target, 'AGENT_APPROVAL_GRANTED')
 
-  // An exact call runs verbatim. Only requests without one (raised by
-  // backend_chat from prose) replay their message through the brain below.
-  const exactArgs = row.toolArgs
-  if (exactArgs && typeof exactArgs === 'object' && !Array.isArray(exactArgs)) {
-    const outcome = await runApprovedCall(row.tool, exactArgs as Record<string, unknown>, {
-      projectId: input.projectId,
-      userId: input.approverUserId,
-      sessionToken: undefined,
-      destructiveConfirmed: true,
-      createdThisTurn: new Set<string>(),
-    })
-    await prisma.agentApprovalRequest.update({
-      where: { id: row.id },
-      data: { status: outcome.status, executedAt: new Date(), resultSummary: outcome.summary.slice(0, 2000) },
-    })
-    return { ok: outcome.status === 'executed', status: outcome.status, resultSummary: outcome.summary }
-  }
-
-  // Execute: replay the original message with destructive confirmation — the
-  // exact resume path the dashboard confirmation card uses.
-  //
-  // ── `executed` must mean "and here is what changed" ─────────────────────────
-  //
-  // The status was derived from `result.success` alone, so it carried no
-  // information about what actually happened to the schema. Two failure modes
-  // followed, in opposite directions (defect #8):
-  //
-  //   • `executed` on a run that succeeded overall while doing something OTHER
-  //     than what was asked — the report saw owner-only auto RLS recorded as a
-  //     successful custom-policy application.
-  //   • `failed` on a run that had already APPLIED part of its plan before
-  //     stopping — "Approved but execution failed" on a request that had removed
-  //     the old policies and re-applied some of them.
-  //
-  // In both cases the truth was in the event stream and was thrown away. The
-  // events are now scanned for mutations that landed, a `partial` status is
-  // recorded when some did and the run still failed, and the applied list is
-  // written into the summary the agent polls. An agent that knows three of five
-  // steps landed can finish the job; one told only "failed" replays the whole
-  // thing.
-  const events: BrainEvent[] = []
-  let summary = ''
-  let ok = false
-  let timedOut = false
-
-  // Same abort-survival accounting as the chat route: an approved replay that
-  // overruns EXECUTE_CAP_MS has still spent the tokens, and the rejected race
-  // means `result` is never readable on that path.
-  let spentTokens = 0
-  let charged = false
-  const chargeOnce = () => {
-    if (charged || spentTokens <= 0) return
-    charged = true
-    // Charged to the project's billing account, like every other model run in
-    // a project, not to whoever happened to approve it.
-    Promise.all([import('@/lib/entitlements/policy'), import('@/lib/usage/account')])
-      .then(async ([{ chargeAiCredits }, { creditAccountOf }]) => {
-        const account = await creditAccountOf(input.projectId)
-        if (account) await chargeAiCredits(account, spentTokens)
-      })
-      .catch(() => {})
-  }
-
-  try {
-    const timeout = new Promise<never>((_, reject) => {
-      setTimeout(() => {
-        timedOut = true
-        reject(new Error(`Approved execution exceeded ${Math.round(EXECUTE_CAP_MS / 1000)}s`))
-      }, EXECUTE_CAP_MS).unref?.()
-    })
-    const result = await Promise.race([
-      runBrain(
-        {
-          projectId: input.projectId,
-          userId: input.approverUserId,
-          message: row.message,
-          sessionToken: undefined,
-          destructiveConfirmed: true,
-          onTokens: (n) => { spentTokens += n },
-        },
-        (e) => events.push(e),
-      ),
-      timeout,
-    ])
-    ok = result.success
-    summary = result.summary
-    // Approval replay runs the brain again — a second full model loop on our
-    // key — so it is charged like any other turn. Without this, escalating a
-    // destructive request through the Review Queue would be a free way to spend
-    // our OpenAI budget.
-    spentTokens = Math.max(spentTokens, result.tokensUsed)
-    chargeOnce()
-  } catch (err: any) {
-    chargeOnce()
-    ok = false
-    summary = err?.message ?? 'Execution failed'
-  }
-
-  const applied = appliedMutations(events)
-
-  // `partial` is a distinct terminal status, not a flavour of failed. A caller
-  // that sees `failed` may safely assume nothing changed; on a partial run that
-  // assumption is false and acting on it double-applies.
-  const status = ok ? 'executed' : applied.length > 0 ? 'partial' : 'failed'
-
-  const detail =
-    status === 'executed'
-      ? summary
-      : status === 'partial'
-        ? `${summary}\n\n⚠️ PARTIALLY APPLIED — ${applied.length} change(s) DID take effect before the run ` +
-          `stopped: ${applied.join('; ')}.\nDo NOT replay the original request; verify the current state with ` +
-          `get_table_schema / read_backend_state and ask for only what is still missing.` +
-          (timedOut ? `\nThe run hit its ${Math.round(EXECUTE_CAP_MS / 1000)}s execution budget.` : '')
-        : `${summary}\n\nNothing was applied — the backend is in the state it was before approval.`
-
+  // The exact call, verbatim. The approver's identity carries the authority;
+  // `destructiveConfirmed` tells the executor its own confirmation gate is
+  // already satisfied for THIS call, which a human just read and approved.
+  const outcome = await runApprovedCall(row.tool, exactArgs as Record<string, unknown>, {
+    projectId: input.projectId,
+    userId: input.approverUserId,
+    sessionToken: undefined,
+    destructiveConfirmed: true,
+    createdThisTurn: new Set<string>(),
+  })
   await prisma.agentApprovalRequest.update({
     where: { id: row.id },
-    data: {
-      status,
-      executedAt: new Date(),
-      resultSummary: detail.slice(0, 2000),
-    },
+    data: { status: outcome.status, executedAt: new Date(), resultSummary: outcome.summary.slice(0, 2000) },
   })
-
-  return { ok, status, resultSummary: detail }
+  return { ok: outcome.status === 'executed', status: outcome.status, resultSummary: outcome.summary }
 }
 
-/**
- * Mutations from a brain run that actually landed.
- *
- * Read-only tools are excluded by prefix rather than by an allowlist of writers,
- * so a tool added later is treated as a mutation until proven otherwise — the
- * safe direction for a function whose job is to warn that something changed.
- */
-const NON_MUTATION_TOOL = /^(read_backend_state|get_|list_|check_|run_query|run_test|finish|answer_question|propose_plan|ask_user)/
-
-function appliedMutations(events: BrainEvent[]): string[] {
-  const out: string[] = []
-  for (const e of events) {
-    if (e.type !== 'tool_done') continue
-    const tool = (e as any).tool as string | undefined
-    if (!tool || NON_MUTATION_TOOL.test(tool)) continue
-    out.push((e as any).title || tool)
-  }
-  return out
-}
+type ApprovalAuditAction =
+  | 'AGENT_APPROVAL_GRANTED'
+  | 'AGENT_APPROVAL_REJECTED'
+  /** Approved, but the request named no exact call, so nothing was run. */
+  | 'AGENT_APPROVAL_UNBOUND_REFUSED'
 
 async function auditDecision(
   input: { projectId: string; approverUserId: string; approvalId: string },
   tool: string,
   target: string,
-  decision: string,
+  action: ApprovalAuditAction,
 ) {
   await prisma.auditLog.create({
     data: {
       projectId: input.projectId,
       userId: input.approverUserId,
-      action: decision === 'approved' ? 'AGENT_APPROVAL_GRANTED' : 'AGENT_APPROVAL_REJECTED',
+      action,
       type: 'mcp',
       details: JSON.stringify({ approvalId: input.approvalId, tool, target, at: new Date().toISOString() }),
       timestamp: new Date(),

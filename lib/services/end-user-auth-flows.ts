@@ -243,9 +243,8 @@ export async function logoutEndUser(
 
 /**
  * POST /auth/forgot-password
- * Generates a single-use, 1-hour reset token. Sends it via SMTP when
- * configured; otherwise returns it in the response so the developer can wire
- * their own delivery. Always 200 for unknown emails (no user enumeration).
+ * Generates a single-use, 1-hour reset token and emails it. The token is never
+ * returned. Always 200 for unknown emails (no user enumeration).
  */
 export async function forgotEndUserPassword(projectId: string, emailRaw: unknown): Promise<AuthFlowResult> {
   try {
@@ -255,82 +254,9 @@ export async function forgotEndUserPassword(projectId: string, emailRaw: unknown
     const email = typeof emailRaw === 'string' ? emailRaw.toLowerCase().trim() : undefined
     if (!email) return err('BAD_REQUEST', 'email is required', 400)
 
-    const schemaName = `workspace_${projectId}`
-
-    // Lazily create the password resets table (no migration required)
-    await prisma.$executeRawUnsafe(`
-      CREATE TABLE IF NOT EXISTS "${schemaName}"."_password_resets" (
-        id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-        email      TEXT        NOT NULL,
-        token      TEXT        NOT NULL UNIQUE,
-        expires_at TIMESTAMPTZ NOT NULL,
-        used_at    TIMESTAMPTZ,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `)
-    await prisma.$executeRawUnsafe(
-      `CREATE INDEX IF NOT EXISTS "_pw_resets_token_idx"
-         ON "${schemaName}"."_password_resets" (token)`,
-    )
-
-    // Purge expired tokens so the table stays small
-    await prisma.$executeRawUnsafe(
-      `DELETE FROM "${schemaName}"."_password_resets" WHERE expires_at < NOW()`,
-    )
-
-    // Look up user — do NOT leak existence via the response.
-    // Service-role: caller has no session user id yet, RLS would hide the row.
-    const users = await executeWithUserContext<{ id: string; email: string }>(
-      '',
-      true,
-      `SELECT id, email FROM "${schemaName}"."users" WHERE email = $1 LIMIT 1`,
-      [email],
-    ).catch(() => [] as { id: string; email: string }[])
-
-    if (users.length > 0) {
-      const token = crypto.randomBytes(32).toString('hex')
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000) // 1 hour
-
-      // Invalidate any existing unused reset for this email
-      await prisma.$executeRawUnsafe(
-        `DELETE FROM "${schemaName}"."_password_resets" WHERE email = $1 AND used_at IS NULL`,
-        email,
-      )
-
-      await prisma.$executeRawUnsafe(
-        `INSERT INTO "${schemaName}"."_password_resets" (email, token, expires_at)
-         VALUES ($1, $2, $3)`,
-        email,
-        token,
-        expiresAt,
-      )
-
-      // Branded delivery: the email carries the app's name and links back to
-      // the app's URL (ProjectAuthConfig), never to backenly.com.
-      let emailSent = false
-      try {
-        const { getAuthEmailContext, sendEndUserPasswordResetEmail } =
-          await import('@/lib/services/end-user-auth-email')
-        const emailCtx = await getAuthEmailContext(projectId)
-        emailSent = await sendEndUserPasswordResetEmail(projectId, email, token, emailCtx)
-      } catch (emailErr: any) {
-        console.warn('[ForgotPassword] Email send failed (non-fatal):', emailErr?.message)
-      }
-
-      if (!emailSent) {
-        // NEVER return the token to the caller — this endpoint is
-        // unauthenticated, so echoing it back would let anyone take over any
-        // account just by knowing the email address. If SMTP isn't configured
-        // the token sits unused in _password_resets until it expires; the
-        // developer must configure SMTP_HOST/SMTP_USER/SMTP_PASS for the flow
-        // to complete.
-        console.warn(
-          `[ForgotPassword] Reset token for project ${projectId} could not be emailed ` +
-          '(SMTP not configured or send failed). The reset flow is broken for this ' +
-          'project until SMTP delivery works.',
-        )
-      }
-    }
+    // The outcome is deliberately discarded: this route is unauthenticated, so
+    // it must answer identically whether or not the account exists.
+    await issueEndUserPasswordReset(projectId, email)
 
     // Generic success — never reveal whether the email was found
     return ok({ message: 'If an account with that email exists, a password reset link has been sent.' })
@@ -338,6 +264,102 @@ export async function forgotEndUserPassword(projectId: string, emailRaw: unknown
     console.error('Forgot password error:', error?.message ?? error)
     return err('INTERNAL_ERROR', 'Failed to process password reset request', 500)
   }
+}
+
+/**
+ * Issue a single-use, one-hour password reset for an end user and email the
+ * link to them. Shared by the public forgot-password route and the operator's
+ * reset tool, so both reset a password the same way: the person who owns the
+ * account receives the link, and nobody else ever sees a credential.
+ *
+ * Reports whether the account exists and whether the email went out, for a
+ * caller entitled to know (an authenticated project operator). The public
+ * route discards both, so it cannot be used to enumerate accounts. The token
+ * itself is never returned to any caller.
+ */
+export async function issueEndUserPasswordReset(
+  projectId: string,
+  emailRaw: string,
+): Promise<{ found: boolean; emailSent: boolean }> {
+  const email = emailRaw.toLowerCase().trim()
+  const schemaName = `workspace_${projectId}`
+
+  // Lazily create the password resets table (no migration required)
+  await prisma.$executeRawUnsafe(`
+    CREATE TABLE IF NOT EXISTS "${schemaName}"."_password_resets" (
+      id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+      email      TEXT        NOT NULL,
+      token      TEXT        NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at    TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `)
+  await prisma.$executeRawUnsafe(
+    `CREATE INDEX IF NOT EXISTS "_pw_resets_token_idx"
+       ON "${schemaName}"."_password_resets" (token)`,
+  )
+
+  // Purge expired tokens so the table stays small
+  await prisma.$executeRawUnsafe(
+    `DELETE FROM "${schemaName}"."_password_resets" WHERE expires_at < NOW()`,
+  )
+
+  // Look up user — do NOT leak existence via the response.
+  // Service-role: caller has no session user id yet, RLS would hide the row.
+  const users = await executeWithUserContext<{ id: string; email: string }>(
+    '',
+    true,
+    `SELECT id, email FROM "${schemaName}"."users" WHERE email = $1 LIMIT 1`,
+    [email],
+  ).catch(() => [] as { id: string; email: string }[])
+
+  let emailSent = false
+  if (users.length > 0) {
+    const token = crypto.randomBytes(32).toString('hex')
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000) // 1 hour
+
+    // Invalidate any existing unused reset for this email
+    await prisma.$executeRawUnsafe(
+      `DELETE FROM "${schemaName}"."_password_resets" WHERE email = $1 AND used_at IS NULL`,
+      email,
+    )
+
+    await prisma.$executeRawUnsafe(
+      `INSERT INTO "${schemaName}"."_password_resets" (email, token, expires_at)
+       VALUES ($1, $2, $3)`,
+      email,
+      token,
+      expiresAt,
+    )
+
+    // Branded delivery: the email carries the app's name and links back to
+    // the app's URL (ProjectAuthConfig), never to backenly.com.
+    try {
+      const { getAuthEmailContext, sendEndUserPasswordResetEmail } =
+        await import('@/lib/services/end-user-auth-email')
+      const emailCtx = await getAuthEmailContext(projectId)
+      emailSent = await sendEndUserPasswordResetEmail(projectId, email, token, emailCtx)
+    } catch (emailErr: any) {
+      console.warn('[ForgotPassword] Email send failed (non-fatal):', emailErr?.message)
+    }
+
+    if (!emailSent) {
+      // NEVER return the token to any caller — the forgot-password route is
+      // unauthenticated, so echoing it back would let anyone take over any
+      // account just by knowing the email address. If SMTP isn't configured
+      // the token sits unused in _password_resets until it expires; the
+      // developer must configure SMTP_HOST/SMTP_USER/SMTP_PASS for the flow
+      // to complete.
+      console.warn(
+        `[ForgotPassword] Reset token for project ${projectId} could not be emailed ` +
+        '(SMTP not configured or send failed). The reset flow is broken for this ' +
+        'project until SMTP delivery works.',
+      )
+    }
+  }
+
+  return { found: users.length > 0, emailSent }
 }
 
 /**
