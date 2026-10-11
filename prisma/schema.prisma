@@ -1279,6 +1279,43 @@ model AiUsage {
   @@map("ai_usage")
 }
 
+/// Model spend for one month (UTC) against one of the deployment's limits:
+/// scope 'total' counts every call, 'platform' the calls Backenly pays for
+/// itself. Reserved before a call, settled after it (lib/ai/llm/spend.ts), so
+/// concurrent calls cannot overshoot a limit between check and charge.
+model AiSpendPeriod {
+  month       String // YYYY-MM, UTC
+  scope       String // total | platform
+  reservedUsd Decimal  @default(0) @db.Decimal(14, 6)
+  settledUsd  Decimal  @default(0) @db.Decimal(14, 6)
+  /// Calls whose result was lost after they were sent, booked at their full
+  /// reservation because a lost answer is not proof nothing ran.
+  unknownUsd  Decimal  @default(0) @db.Decimal(14, 6)
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  @@id([month, scope])
+  @@map("ai_spend_periods")
+}
+
+/// One call's reservation. A call that never settles (the process died) is
+/// still accounted for: past `expiresAt` it is booked as unknown usage.
+model AiSpendHold {
+  id         String    @id @default(uuid())
+  month      String
+  scopes     String[]
+  purpose    String
+  model      String
+  amountUsd  Decimal   @db.Decimal(14, 6)
+  status     String    @default("reserved") // reserved | settled | released | unknown
+  chargedUsd Decimal?  @db.Decimal(14, 6)
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  settledAt  DateTime?
+
+  @@index([status, expiresAt])
+  @@map("ai_spend_holds")
+}
+
 // Billing-specific usage tracking (user-scoped, monthly)
 // `date` is stored as YYYY-MM for monthly reset
 model UserAiUsage {

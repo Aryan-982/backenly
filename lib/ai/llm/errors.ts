@@ -35,6 +35,9 @@ export type AiErrorKind =
   | 'refused'
   | 'output_invalid'
   | 'aborted'
+  | 'spend_limit'
+  | 'spend_unavailable'
+  | 'credits_exhausted'
 
 export type Consumption = 'none' | 'ran' | 'unknown'
 
@@ -49,6 +52,9 @@ const USER_MESSAGE: Record<AiErrorKind, string> = {
   refused: 'The model declined this request.',
   output_invalid: 'The model’s answer was cut off or did not match the required format.',
   aborted: 'The request was cancelled.',
+  spend_limit: 'This deployment has reached its AI spending limit for the month, so the request was not sent.',
+  spend_unavailable: 'AI spend could not be recorded, so the request was not sent.',
+  credits_exhausted: 'This account has used its AI credits for the month.',
 }
 
 export class AiError extends Error {

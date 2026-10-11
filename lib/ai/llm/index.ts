@@ -12,31 +12,36 @@
  * What it guarantees:
  *   - every request carries an explicit output ceiling and only parameters the
  *     routed model accepts (lib/ai/llm/params.ts);
+ *   - its worst-case cost is reserved against the deployment's monthly limits
+ *     before it is sent, and settled from the provider's own usage after
+ *     (lib/ai/llm/spend.ts); a reservation that cannot be written stops the call;
  *   - every failure is an AiError with a kind, user-facing copy and whether
  *     inference may have run (lib/ai/llm/errors.ts);
  *   - a failure is retried only when the provider rejected it before inference,
  *     so a retry can never run, and bill, a request twice;
  *   - usage comes back in one shape with cache reads and writes kept apart, and
  *     priced at the model's own cache rates (lib/ai/cost-tracker.ts).
- *
- * It does not charge anyone. Metering and spend limits sit above it.
  */
 
 import type Anthropic from '@anthropic-ai/sdk'
-import { calculateCost } from '../cost-tracker'
 import { resolveProvider, routeFor, type ProviderConfig } from './config'
 import { AiError, classifyProviderError } from './errors'
 import { buildParams, shouldStream } from './params'
 import { anthropicProvider, bedrockProvider } from './providers/anthropic'
 import { openaiProvider } from './providers/openai'
-import type { GenerateRequest, GenerateResult, LlmProvider, NormalizedUsage, ProviderId, PurposeRoute } from './types'
+import { defaultPayer, reserveSpend, settleSpend } from './spend'
+import type { GenerateRequest, GenerateResult, LlmProvider, ProviderId, PurposeRoute } from './types'
+import { costOf, maxCostOf, normalizeUsage } from './usage'
 
 export type { AiPurpose, GenerateRequest, GenerateResult, NormalizedUsage, ProviderId } from './types'
 export { AiError } from './errors'
 export type { AiErrorKind, Consumption } from './errors'
 export { aiAvailability } from './config'
+export { normalizeUsage, costOf } from './usage'
 
 const MAX_ATTEMPTS = 3
+/** Margin past the last attempt's timeout before an unsettled reservation is booked as unknown. */
+const SETTLE_GRACE_MS = 5 * 60_000
 
 let override: LlmProvider | null = null
 let cached: { key: string; provider: LlmProvider } | null = null
@@ -66,29 +71,6 @@ function currentProvider(): LlmProvider {
     c.id === 'bedrock' ? bedrockProvider(c.region) : c.id === 'anthropic' ? anthropicProvider(c.apiKey) : openaiProvider(c.apiKey)
   cached = { key, provider }
   return provider
-}
-
-export function normalizeUsage(u: Anthropic.Usage | null | undefined): NormalizedUsage {
-  const read = u?.cache_read_input_tokens ?? 0
-  const write = u?.cache_creation_input_tokens ?? 0
-  const write1h = u?.cache_creation?.ephemeral_1h_input_tokens ?? 0
-  const write5m = u?.cache_creation ? (u.cache_creation.ephemeral_5m_input_tokens ?? 0) : Math.max(0, write - write1h)
-  const input = u?.input_tokens ?? 0
-  return {
-    promptTokens: input + read + write,
-    inputTokens: input,
-    cacheReadTokens: read,
-    cacheWrite5mTokens: write5m,
-    cacheWrite1hTokens: write1h,
-    outputTokens: u?.output_tokens ?? 0,
-  }
-}
-
-export function costOf(model: string, usage: NormalizedUsage): number {
-  return calculateCost(model, usage.promptTokens, usage.outputTokens, usage.cacheReadTokens, {
-    tokens5m: usage.cacheWrite5mTokens,
-    tokens1h: usage.cacheWrite1hTokens,
-  })
 }
 
 function finish(
@@ -150,6 +132,16 @@ export async function generate(req: GenerateRequest): Promise<GenerateResult> {
   const params = buildParams(route, req)
   const stream = shouldStream(route, params.max_tokens)
 
+  const reservation = await reserveSpend({
+    purpose: req.purpose,
+    model: route.model,
+    payer: req.payer ?? defaultPayer(req.purpose),
+    amountUsd: maxCostOf(route.model, params),
+    expiresInMs: route.timeoutMs * MAX_ATTEMPTS + SETTLE_GRACE_MS,
+    billingAccountId: req.billing?.billingAccountId,
+    projectId: req.billing?.projectId,
+  })
+
   for (let attempt = 1; ; attempt++) {
     let message: Anthropic.Message
     try {
@@ -161,8 +153,29 @@ export async function generate(req: GenerateRequest): Promise<GenerateResult> {
         await sleep(retryDelayMs(attempt))
         continue
       }
+      await settleFailure(reservation, e, route.model)
       throw e
     }
-    return finish(message, provider.id, route, req, attempt)
+
+    try {
+      const result = finish(message, provider.id, route, req, attempt)
+      await settleSpend(reservation, { consumption: 'ran', costUsd: result.costUsd, usage: result.usage })
+      return result
+    } catch (err) {
+      const e = err instanceof AiError ? err : classifyProviderError(err, provider.id)
+      await settleFailure(reservation, e, route.model)
+      throw e
+    }
+  }
+}
+
+async function settleFailure(reservation: Awaited<ReturnType<typeof reserveSpend>>, e: AiError, model: string): Promise<void> {
+  if (e.consumption === 'ran' && e.usage) {
+    await settleSpend(reservation, { consumption: 'ran', costUsd: costOf(model, e.usage), usage: e.usage })
+  } else if (e.consumption === 'none') {
+    await settleSpend(reservation, { consumption: 'none' })
+  } else {
+    // Inference may have run and its usage is not known: book the reservation.
+    await settleSpend(reservation, { consumption: 'unknown' })
   }
 }

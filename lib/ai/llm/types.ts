@@ -50,6 +50,13 @@ export interface GenerateRequest {
   /** Ask for JSON that matches this schema (`output_config.format`). */
   jsonSchema?: Record<string, unknown>
   signal?: AbortSignal
+  /**
+   * Who pays. Defaults by purpose: `autonomy.*` is the deployment's own spend,
+   * everything else a customer's (lib/ai/llm/spend.ts).
+   */
+  payer?: 'customer' | 'platform'
+  /** The account a customer-paid call is held against and charged to. */
+  billing?: { billingAccountId?: string; projectId?: string }
 }
 
 /** Token counts in one shape for every provider. */
