@@ -73,7 +73,7 @@ The migration agent compared the live schema with the latest snapshot. The canon
 
 One limit applies. `external_schema_change` depends on the event trigger that `scripts/setup-direct-access.sql` installs. Without it, DDL run outside the platform by an operator with database credentials is not recorded. The snapshot check saw such changes, but only as differences, with no record of who made them or how.
 
-The agent's `missing_table` fired for every table dropped after its snapshot. `lib/core/finding-reaper.ts` documents those findings sitting open forever after load-test runs. A table dropped through the platform is a legitimate outcome, and one dropped over a direct connection is already recorded.
+The agent's `missing_table` fired for every table dropped after its snapshot. Load-test runs left such findings open until a dedicated reaper was added to withdraw them. A table dropped through the platform is a legitimate outcome, and one dropped over a direct connection is already recorded.
 
 ### Foreign key to a missing table
 
@@ -83,17 +83,31 @@ PostgreSQL refuses to drop a table that a foreign key references. `DROP ... CASC
 
 Turning realtime on for a table is installing its trigger (`lib/services/realtimeTriggers.ts`). A table without one simply has realtime off, which is a choice, and nothing records an intent to compare against. The agent filed a defect against every project that had not turned realtime on.
 
-## What retirement must preserve
+## How it is retired
 
-The orchestrator's findings are recognized by the canonical kernel through the `PREFIX_MAP` aliases in `lib/core/types.ts`. Some may therefore carry approval or repair state.
+`lib/ai/background-monitor.ts` no longer runs the orchestrator; it runs the canonical loop. The on-demand `/api/projects/[id]/agents` route, which had no callers, is deleted. The agent modules themselves are unreachable and are removed separately.
 
-Before any of them is withdrawn:
+**Its findings** were recognized by the canonical kernel through the `PREFIX_MAP` aliases in `lib/core/types.ts`, so some may carry approval or repair state. `retireOrchestratorFindings` (`lib/core/finding-reaper.ts`) runs on every scheduled scan and every Re-scan.
 
-- A finding with any of the following stays listed and is re-evaluated by the canonical detector for its base type:
-  - `appliedUnverified`;
-  - `rollbackData`;
-  - a `HEALTH_FIX_APPROVED` audit row;
-  - an in-flight approval.
-- Every withdrawal records `withdrawnBy: 'detector_retired'`.
-- The aliases `orphaned_fk -> missing_fk` and `auth_gap -> broken_auth` map to "retired: no fix action". Today, approving either runs a repair other than the one the finding describes.
-- Historic `AGENT_AUTO_FIXED` rows are shown as applied but not verified.
+- It withdraws each open finding the orchestrator filed (`details.agentType`), recording `withdrawnBy: 'detector_retired'` and the time.
+- It keeps any finding someone already acted on:
+  - one carrying `appliedUnverified`;
+  - one carrying `rollbackData`;
+  - one named by a `HEALTH_FIX_APPROVED` audit row.
+
+  Those stay listed and read "From a retired check: …" wherever they are summarised.
+- Each run that withdraws anything writes one `AUTONOMY_DETECTOR_RETIRED` audit row with what it withdrew and what it kept.
+
+**Three aliases are removed:**
+
+| Alias | What approving it actually ran |
+|---|---|
+| `orphaned_fk -> missing_fk` | `ADD_CONSTRAINT`, for a finding that said to drop a broken foreign key |
+| `auth_gap -> broken_auth` | `FIX_AUTH`, on a project that had not asked for auth |
+| `missing_realtime_triggers -> realtime_gap` | `FIX_REALTIME` |
+
+Those types now normalise to nothing: no fix action, a manual hint only.
+
+**History.** Historic `AGENT_AUTO_FIXED` rows record no re-check. Every feed shows them as applied but not confirmed.
+
+The trust scoreboard's rollback count is now the fixes a person undid with Undo. It used to count deploy and version rollbacks people asked for, and never counted an undone fix.
