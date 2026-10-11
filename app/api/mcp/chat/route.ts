@@ -12,9 +12,10 @@ export const dynamic = 'force-dynamic'
  * tool call.
  *
  * Billing — two separate ledgers, do not confuse them:
- *   1. PLATFORM COST. `runBrain` calls `trackCompletionCost` per completion,
- *      which writes `ai_usage` (model, tokens, cost, endpoint). That is our
- *      OpenAI spend, for our own accounting. It charges the user nothing.
+ *   1. PLATFORM COST. Every model call the brain makes goes through the AI
+ *      gateway (lib/ai/llm), which reserves it against the deployment's monthly
+ *      AI limits and writes `ai_usage` (model, tokens, cost, endpoint). That is
+ *      our model spend, for our own accounting. It charges the user nothing.
  *   2. USER CREDITS. `enforceAiCredits` gates the turn and `chargeAiCredits`
  *      debits the tokens the turn actually burned (`result.tokensUsed`).
  *

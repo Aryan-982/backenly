@@ -577,6 +577,13 @@ __tests__/usage/usage-ledger.test.ts
 # unknown. Row locks are the property, so it needs a real Postgres.
 tests/integration/ai-spend-ledger.spec.ts
 
+# The brain on the AI gateway, end to end with a scripted model: what each call
+# sends, every tool call answered in one turn with thinking carried back, credits
+# in cost-weighted tokens, usage rows per call, and the approval gate, cut-off,
+# deadline and no-provider paths. It reads and writes the project, its
+# workspace schema and its conversation, so it needs a real Postgres.
+tests/integration/brain-on-gateway.spec.ts
+
 # Every meter measures what lib/usage/axes.ts says: streamed egress bytes once and
 # never for internal traffic, MAU once per user per month, database size including
 # branch schemas, file size from metadata, and function runs that executed.

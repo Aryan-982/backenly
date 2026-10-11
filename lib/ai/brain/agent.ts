@@ -22,11 +22,18 @@
  *   3. The agent loop never even sees the mutation tool surface for that turn.
  */
 
-import type { OpenAI } from 'openai'
-import { getOpenAIClient, trackCompletionCost } from '../openai-service'
-import { effectiveTokens } from '../cost-tracker'
-import { getModel } from '../model-router'
+import type Anthropic from '@anthropic-ai/sdk'
+import { aiAvailability, AiError, effectiveTokensOf, generate, type GenerateResult } from '../llm'
 import { agentSystemPrompt, clarifyPrompt } from './prompts'
+import {
+  conversationFor,
+  modelFailureOf,
+  textOf,
+  toModelTool,
+  toolResultBlock,
+  toolUsesOf,
+  type ModelFailure,
+} from './model'
 import { collectProof, formatProof } from '../proof-system'
 import { loadBrainMemory, formatUnderstanding, formatRecentHistory, saveTurn, type ConversationTurn } from './memory'
 import { classify, type BrainIntent, type Classification } from './classifier'
@@ -273,6 +280,12 @@ export type BrainFailureCode =
   | 'MODEL_TIMEOUT'
   /** The model errored for some other reason. Retryable once. */
   | 'MODEL_ERROR'
+  /**
+   * No model can be called here right now: no provider is configured, the
+   * provider is out of quota or credit, or a monthly AI spending limit is
+   * reached. Not retryable until that changes; the typed tools need no AI.
+   */
+  | 'AI_UNAVAILABLE'
   /** Hit MAX_ITERATIONS. Not retryable as-is — continue instead. */
   | 'STEP_BUDGET_EXHAUSTED'
   /** The turn ended asking the user something. Not a failure to retry. */
@@ -417,6 +430,20 @@ export async function runBrain(
 ): Promise<BrainResult> {
   const toolsRun: string[] = []
 
+  // ── No model, no turn ───────────────────────────────────────────────────
+  // Every path below needs a model. Without one configured, each would fail
+  // somewhere less explicable: the classifier hedged to UNCLEAR, and the turn
+  // asked a clarifying question nothing could act on. Say what is true, first.
+  const ai = aiAvailability()
+  if ('reason' in ai) {
+    return stoppedBeforeStarting(
+      { code: 'AI_UNAVAILABLE', reason: 'no AI provider is configured on this deployment', retryable: false },
+      emit,
+      toolsRun,
+      ai.reason,
+    )
+  }
+
   // ── No confirmation by message ──────────────────────────────────────────
   // A message never confirms anything. A destructive or high-risk call runs
   // only through a human's approval of that exact call (lib/mcp/approvals.ts),
@@ -444,21 +471,30 @@ export async function runBrain(
     loadResumeQueue(input.projectId).then(q => q !== null).catch(() => false),
     loadPendingPlan(input.projectId).then(p => p !== null).catch(() => false),
   ])
-  const classification = await classify({
-    message: input.message,
-    recentHistory: recent,
-    hasPendingProposal,
-    // A pending plan, a pending blueprint, OR an outstanding resume queue
-    // all signal the classifier that short imperatives like "continue" /
-    // "finish it" / "resume" are CONFIRM, not UNCLEAR. Without this, the
-    // classifier defaulted to UNCLEAR ("could you tell me a bit more
-    // about 'continue'") and the user burned credits in confused loops.
-    hasPendingPlan: hasPendingBlueprint || hasResumeQueue || detectPendingPlan(memory.history),
-    // On an empty project, an app description has one meaning: build it. This
-    // stops the classifier dead-ending "Users can post recipes and follow
-    // each other" in a canned clarification.
-    isFreshProject,
-  })
+  let classification: Classification
+  try {
+    classification = await classify({
+      projectId: input.projectId,
+      message: input.message,
+      recentHistory: recent,
+      hasPendingProposal,
+      // A pending plan, a pending blueprint, OR an outstanding resume queue
+      // all signal the classifier that short imperatives like "continue" /
+      // "finish it" / "resume" are CONFIRM, not UNCLEAR. Without this, the
+      // classifier defaulted to UNCLEAR ("could you tell me a bit more
+      // about 'continue'") and the user burned credits in confused loops.
+      hasPendingPlan: hasPendingBlueprint || hasResumeQueue || detectPendingPlan(memory.history),
+      // On an empty project, an app description has one meaning: build it. This
+      // stops the classifier dead-ending "Users can post recipes and follow
+      // each other" in a canned clarification.
+      isFreshProject,
+    })
+  } catch (err) {
+    // The provider could not answer the very first call (classify rethrows
+    // only provider failures). Every later step needs it too, so stop here and
+    // say why, rather than guessing an intent.
+    return stoppedBeforeStarting(modelFailureOf(err), emit, toolsRun)
+  }
   emit({
     type: 'classification',
     intent: classification.intent,
@@ -554,7 +590,7 @@ export async function runBrain(
       // Architect failed to resolve anything → fall through to a real clarification.
     }
     console.log(`[Brain] route=UNCLEAR → ask_user`)
-    const q = await synthesiseClarification(input.message, recent)
+    const q = await synthesiseClarification(input.message, recent, input.projectId)
     return await singleToolTurn('ask_user', { question: q.question, options: q.options }, dispatchCtx, classification, emit, input)
   }
 
@@ -1180,28 +1216,28 @@ async function runAgentLoop(
   emit: (e: BrainEvent) => void,
   toolsRun: string[],
 ): Promise<BrainResult> {
-  const openai = getOpenAIClient()
   const turnTools = toolsForIntent(classification.intent)
 
+  // ── What the model is sent ────────────────────────────────────────────────
+  //
+  // Render order is tools → system → messages, and caching is a prefix match.
+  // The tool catalog (~15.7k tokens) and the agent prompt are identical on
+  // every call, across turns and projects, so they come first and are cached.
+  // This turn's own context (project state, classification) follows them as a
+  // second, uncached system block: in the prompt itself it would make the
+  // cached prefix unique to every turn. The conversation is cached too, so each
+  // step of a multi-step build reads the previous steps from the cache.
+  const system = agentSystemPrompt()
   const intentHint = buildIntentHint(classification.intent)
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-    { role: 'system', content: agentSystemPrompt() },
-    {
-      role: 'system',
-      content:
-        `${understandingBlock}\n\n` +
-        (rolledSummary ? `EARLIER CONTEXT:\n${rolledSummary}\n\n` : '') +
-        `INTENT CLASSIFICATION (advisory): ${classification.intent} (${classification.confidence.toFixed(2)}) — ${classification.reasoning}\n` +
-        `${intentHint}\n` +
-        (input.surface
-          ? `USER'S CURRENT PAGE: ${input.surface} — deictic references ("this table", "this page", "why is this failing") likely point at what that section shows. Use it to resolve ambiguity; never refuse because a name was omitted when the page implies it.\n`
-          : ''),
-    },
-  ]
-  for (const turn of recent) {
-    messages.push({ role: turn.role, content: turn.content })
-  }
-  messages.push({ role: 'user', content: input.message })
+  const context =
+    `${understandingBlock}\n\n` +
+    (rolledSummary ? `EARLIER CONTEXT:\n${rolledSummary}\n\n` : '') +
+    `INTENT CLASSIFICATION (advisory): ${classification.intent} (${classification.confidence.toFixed(2)}) — ${classification.reasoning}\n` +
+    `${intentHint}\n` +
+    (input.surface
+      ? `USER'S CURRENT PAGE: ${input.surface} — deictic references ("this table", "this page", "why is this failing") likely point at what that section shows. Use it to resolve ambiguity; never refuse because a name was omitted when the page implies it.\n`
+      : '')
+  const messages = conversationFor(recent, input.message)
 
   let mutated = false
   let verifiedAfterMutation = false
@@ -1209,9 +1245,8 @@ async function runAgentLoop(
   let success = false
   let needsUser = false
   let terminalData: unknown = null
-  let modelFailed = false
-  let modelFailureReason = ''
-  let modelFailureCode: BrainFailureCode | undefined
+  /** Set when a model call failed, classified once for both the prose and the caller's code. */
+  let modelFailure: ModelFailure | null = null
   /** Mutations that landed this turn — reported even if the turn later fails. */
   const appliedMutationTitles: string[] = []
   /**
@@ -1229,6 +1264,20 @@ async function runAgentLoop(
    */
   const refusedMutations: Array<{ title: string; reason: string }> = []
   let tokensUsed = 0
+  // ── Meter what the turn COST, not how many tokens crossed the wire ──────────
+  //
+  // Weighted at the model's own cache prices: from the second step on, the
+  // catalog and the earlier steps are cache reads at a tenth of the input price
+  // on Claude. Charging raw totals billed a user the full catalog on every step
+  // of a multi-step build, penalising the deep, useful builds hardest for
+  // context they never asked for and we were not re-paying for. Reported as
+  // spent, not as returned — see BrainInput.onTokens: a caller racing a wall
+  // clock only ever sees this.
+  const spend = (tokens: number) => {
+    if (!(tokens > 0)) return
+    tokensUsed += tokens
+    try { input.onTokens?.(tokens) } catch { /* billing must never break the loop */ }
+  }
   // Per-tool outcome, aligned by index to `toolsRun`. Recorded to Memory so an
   // action that landed reads 'applied' even when a later model call in this
   // same loop times out — the turn-level `success` flag must never smear
@@ -1255,88 +1304,98 @@ async function runAgentLoop(
       break
     }
 
-    let completion: OpenAI.Chat.Completions.ChatCompletion
+    // ── The model call never eats the verification reserve ───────────────────
+    //
+    // The check above only runs between steps, and one model step can take tens
+    // of seconds. A call still running when the reserve begins is cancelled and
+    // the loop stops exactly as if the check had fired, so the reserve is spent
+    // on verifying what landed instead of on a step the caller will never see.
+    const call = new AbortController()
+    let reserveReached = false
+    const reserveTimer = input.deadlineAt
+      ? setTimeout(() => {
+          reserveReached = true
+          call.abort()
+        }, Math.max(0, input.deadlineAt - VERIFY_RESERVE_MS - Date.now()))
+      : undefined
+
+    // Retries live in the gateway, which repeats only a request the provider
+    // refused before running it. A timeout is never repeated here: the request
+    // may already have run, and repeating it could run (and bill) it twice.
+    let reply: GenerateResult
     try {
-      completion = await callModelWithRetry(openai, messages, turnTools)
+      reply = await generate({
+        purpose: 'brain.agent',
+        system,
+        context,
+        messages,
+        tools: turnTools,
+        cacheConversation: true,
+        signal: call.signal,
+        billing: { projectId: input.projectId },
+        label: 'brain-agent',
+      })
     } catch (err) {
-      const e = err as any
-      console.error('[Brain] model call failed mid-loop (after 1 retry):', {
-        status: e?.status,
-        code: e?.code,
-        type: e?.type,
-        message: e instanceof Error ? e.message : String(e),
+      if (reserveReached) {
+        budgetStopped = true
+        break
+      }
+      // A model that ran and was then refused or cut off still consumed what
+      // it says it did, and that is billed like any other step.
+      if (err instanceof AiError && err.consumption === 'ran' && err.usage) {
+        spend(effectiveTokensOf(err.model ?? '', err.usage))
+      }
+      console.error('[Brain] model call failed mid-loop:', {
+        kind: err instanceof AiError ? err.kind : undefined,
+        status: err instanceof AiError ? err.status : undefined,
+        consumption: err instanceof AiError ? err.consumption : undefined,
+        attempts: err instanceof AiError ? err.attempts : undefined,
+        message: err instanceof Error ? err.message : String(err),
         iter,
         mutated,
       })
-      modelFailed = true
       // Classified ONCE, into prose for the human and a code for the caller.
       // Deriving them separately is how the prose came to say "rate-limited" while
       // the transport reported an unclassified `Brain run failed.`
-      if (e?.status === 429 || /rate.?limit/i.test(e?.message ?? '')) {
-        modelFailureReason = 'the AI provider rate-limited us'
-        modelFailureCode = 'RATE_LIMITED'
-      } else if (/timeout|timed out/i.test(e?.message ?? '')) {
-        modelFailureReason = 'the AI model timed out'
-        modelFailureCode = 'MODEL_TIMEOUT'
-      } else {
-        modelFailureReason = 'the AI model returned an error'
-        modelFailureCode = 'MODEL_ERROR'
-      }
+      modelFailure = modelFailureOf(err)
+      break
+    } finally {
+      clearTimeout(reserveTimer)
+    }
+
+    spend(effectiveTokensOf(reply.model, reply.usage))
+
+    const text = textOf(reply.message)
+    if (text) emit({ type: 'thinking', text: text.slice(0, 320) })
+
+    // Cut off at the output ceiling: the last block may be a half-written tool
+    // call, so nothing in this answer is run.
+    if (reply.message.stop_reason === 'max_tokens') {
+      modelFailure = { code: 'MODEL_ERROR', reason: "the AI model's answer was cut off at its output limit", retryable: true }
       break
     }
 
-    if (input.projectId) trackCompletionCost(completion, input.projectId, 'brain-agent')
-    // ── Meter what the turn COST, not how many tokens crossed the wire ────────
-    //
-    // The tool catalog (~15.7k tokens) is re-sent on every iteration and served
-    // from OpenAI's prompt cache at a quarter of the price after the first call.
-    // Charging raw totals billed a user the full catalog on every step of a
-    // multi-step build — the deep, useful builds were penalised hardest, for
-    // context they never asked for and we were not re-paying for.
-    const u = completion.usage
-    const turnTokens = u
-      ? effectiveTokens(u.prompt_tokens, u.completion_tokens, u.prompt_tokens_details?.cached_tokens ?? 0)
-      : 0
-    tokensUsed += turnTokens
-    // Report as spent, not as returned — see BrainInput.onTokens. A caller
-    // racing a wall clock only ever sees this.
-    if (turnTokens > 0) {
-      try { input.onTokens?.(turnTokens) } catch { /* billing must never break the loop */ }
-    }
-
-    const choice = completion.choices[0]
-    const msg = choice?.message
-    if (!msg) break
-
-    if (msg.content?.trim()) {
-      emit({ type: 'thinking', text: msg.content.trim().slice(0, 320) })
-    }
-
-    const toolCalls = msg.tool_calls ?? []
+    const toolCalls = toolUsesOf(reply.message)
     if (toolCalls.length === 0) {
       // Model answered without tools — accept its text as the final summary.
-      finalSummary = (msg.content ?? '').trim() || 'Done.'
+      finalSummary = text || 'Done.'
       success = true
       break
     }
 
-    // Record the assistant turn with tool calls before appending results
-    messages.push({
-      role: 'assistant',
-      content: msg.content ?? '',
-      tool_calls: toolCalls,
-    })
+    // The assistant turn goes back exactly as it came, thinking blocks
+    // included: with thinking on, a tool result sent without the thinking that
+    // led to its call is rejected.
+    messages.push({ role: 'assistant', content: reply.message.content })
 
+    // Every call of this step is answered, in order, in ONE user turn.
+    // Splitting results across turns teaches the model to stop calling tools in
+    // parallel, and a call left unanswered is rejected outright.
+    const results: Anthropic.ToolResultBlockParam[] = []
     let finished = false
-    for (const call of toolCalls) {
-      if (call.type !== 'function') continue
-      const toolName = call.function.name as ToolName
-      let args: Record<string, unknown> = {}
-      try {
-        args = call.function.arguments ? JSON.parse(call.function.arguments) : {}
-      } catch {
-        args = {}
-      }
+    for (const toolCall of toolCalls) {
+      const toolName = toolCall.name as ToolName
+      const args = (toolCall.input && typeof toolCall.input === 'object' ? toolCall.input : {}) as Record<string, unknown>
 
       // Approval gate — one rule for every door. `needsApproval` is the same
       // judgement the MCP tool route uses: the brain's destructive set OR an
@@ -1358,20 +1417,22 @@ async function runAgentLoop(
             reversible: danger.reversible,
           })
         }
-        messages.push({
-          role: 'tool',
-          tool_call_id: call.id,
-          content: JSON.stringify({
-            ok: false,
-            blocked: 'needs_human_approval',
-            summary:
-              `\`${toolName}\` on ${danger.target} needs a human's approval and was NOT run` +
-              (danger.rowCount !== null ? ` — ${danger.rowCount} live row${danger.rowCount === 1 ? '' : 's'} affected` : '') +
-              `. It has been queued, exactly as you issued it, for the project owner to approve or reject in ` +
-              `the Backenly dashboard. Call finish and briefly state what will happen if it is approved. ` +
-              `Do not ask for a confirmation phrase: no message can approve it.`,
-          }),
-        })
+        results.push(
+          toolResultBlock(
+            toolCall.id,
+            {
+              ok: false,
+              blocked: 'needs_human_approval',
+              summary:
+                `\`${toolName}\` on ${danger.target} needs a human's approval and was NOT run` +
+                (danger.rowCount !== null ? ` — ${danger.rowCount} live row${danger.rowCount === 1 ? '' : 's'} affected` : '') +
+                `. It has been queued, exactly as you issued it, for the project owner to approve or reject in ` +
+                `the Backenly dashboard. Call finish and briefly state what will happen if it is approved. ` +
+                `Do not ask for a confirmation phrase: no message can approve it.`,
+            },
+            true,
+          ),
+        )
         continue
       }
 
@@ -1425,11 +1486,7 @@ async function runAgentLoop(
         result.summary && result.summary.length > 500
           ? result.summary.slice(0, 500) + '…'
           : result.summary
-      messages.push({
-        role: 'tool',
-        tool_call_id: call.id,
-        content: JSON.stringify({ ok: result.ok, summary: clippedSummary }),
-      })
+      results.push(toolResultBlock(toolCall.id, { ok: result.ok, summary: clippedSummary }, !result.ok))
 
       if (result.terminal) {
         finalSummary = result.summary || 'Done.'
@@ -1441,13 +1498,20 @@ async function runAgentLoop(
     }
 
     if (finished) {
-      // Steer the model to verify if it tried to finish after mutating
+      // Steer the model to verify if it tried to finish after mutating. The
+      // steer rides in the same user turn as the results: the routed models
+      // take no system message mid-conversation.
       if (mutated && !verifiedAfterMutation && !needsUser) {
         emit({ type: 'phase', phase: 'verify' })
         messages.push({
-          role: 'system',
-          content:
-            'You called finish after mutating state but did not verify. Run ONE verification pass — a single read_backend_state, plus at most one run_test on a new endpoint — then finish again with a truthful summary. Do not test create/list/get separately; one passing call is enough.',
+          role: 'user',
+          content: [
+            ...results,
+            {
+              type: 'text',
+              text: 'You called finish after mutating state but did not verify. Run ONE verification pass — a single read_backend_state, plus at most one run_test on a new endpoint — then finish again with a truthful summary. Do not test create/list/get separately; one passing call is enough.',
+            },
+          ],
         })
         success = false
         continue
@@ -1455,14 +1519,15 @@ async function runAgentLoop(
       break
     }
 
+    messages.push({ role: 'user', content: results })
     emit({ type: 'phase', phase: mutated ? 'execute' : 'route' })
   }
 
   // Truthful failure handling. NEVER claim total failure when work landed —
   // and never call a failure "transient" when we don't know that: name the
   // actual reason so a repeated failure reads as what it is.
-  if (modelFailed) {
-    const reason = modelFailureReason || 'the AI model returned an error'
+  if (modelFailure) {
+    const { reason, retryable, code } = modelFailure
     if (mutated) {
       const proof = await collectProof(input.projectId).catch(() => null)
       const state = proof && !proof.nothingBuilt ? formatProof(proof) : ''
@@ -1470,11 +1535,14 @@ async function runAgentLoop(
         `I applied changes, then ${reason} before I could finish verifying. ` +
         'This is the real current state of your backend:\n\n' +
         (state || 'Could not re-read the state. Open the dashboard to confirm.') +
-        '\n\nSay "continue" and I\'ll finish and verify the rest. If this keeps happening, wait a minute before retrying.'
+        (retryable
+          ? '\n\nSay "continue" and I\'ll finish and verify the rest. If this keeps happening, wait a minute before retrying.'
+          : code === 'AI_UNAVAILABLE'
+            ? '\n\nThe changes above are in place. Say "continue" once AI is available again and I\'ll finish and verify the rest.'
+            : '\n\nThe changes above are in place. Rephrase what is left and I\'ll pick it up from here.')
       // success stays false (we did not cleanly finish) but the message is honest.
     } else {
-      finalSummary =
-        `I stopped before changing anything because ${reason}. Nothing was modified. Please try again in a moment.`
+      finalSummary = nothingChangedBecause(modelFailure)
     }
     emit({ type: 'error', message: `Recovered from a mid-loop model failure (${reason}) — reported the true state.` })
   }
@@ -1532,8 +1600,8 @@ async function runAgentLoop(
   // able to distinguish "the run stopped" from "nothing changed".
   const failureCode: BrainFailureCode | undefined = success
     ? undefined
-    : modelFailureCode
-      ? modelFailureCode
+    : modelFailure
+      ? modelFailure.code
       : needsUser
         ? 'NEEDS_USER'
         : iter >= MAX_ITERATIONS
@@ -1541,8 +1609,6 @@ async function runAgentLoop(
           : toolStatuses.includes('failed')
             ? 'TOOL_REFUSED'
             : undefined
-
-  const RETRYABLE: BrainFailureCode[] = ['RATE_LIMITED', 'MODEL_TIMEOUT', 'MODEL_ERROR']
 
   return {
     success,
@@ -1552,7 +1618,9 @@ async function runAgentLoop(
     toolsRun,
     classification,
     tokensUsed,
-    ...(failureCode ? { failureCode, retryable: RETRYABLE.includes(failureCode) } : {}),
+    // Only a model failure can be worth retrying as-is: out of steps means
+    // "continue", and a tool that refused on the merits refuses again.
+    ...(failureCode ? { failureCode, retryable: modelFailure?.retryable ?? false } : {}),
     applied: appliedMutationTitles,
     // Reported on EVERY path, including a turn that otherwise succeeded. A
     // request whose six items produced four changes and two refusals is not a
@@ -1569,58 +1637,64 @@ async function runAgentLoop(
  * Tools removed from the surface when the user is CONFIRMING a plan. Once the
  * user has said "go ahead", offering propose_plan to the model again is the
  * exact bug that made "go ahead" re-emit the same plan instead of running it:
- * with low temperature the model pattern-matches the previous assistant turn
- * and just re-proposes. Removing the tool makes the bug physically impossible.
+ * the model pattern-matches the previous assistant turn and just re-proposes.
+ * Removing the tool makes the bug physically impossible.
  *
  * ask_user is kept (execution can still discover a missing credential).
  */
 const CONFIRM_TOOL_BLOCKLIST = new Set<string>(['propose_plan'])
 
-// BRAIN_MODEL_TOOLS, not BRAIN_TOOLS: tools only an MCP agent calls are not offered to the model.
-function toolsForIntent(intent: BrainIntent): OpenAI.Chat.Completions.ChatCompletionTool[] {
-  if (intent !== 'CONFIRM') return BRAIN_MODEL_TOOLS
-  return BRAIN_MODEL_TOOLS.filter((t) => !CONFIRM_TOOL_BLOCKLIST.has(t.function.name))
+/**
+ * The catalog as the brain's model is offered it, translated once at load so
+ * every call sends byte-identical tools and the cached prefix holds across
+ * turns. BRAIN_MODEL_TOOLS, not BRAIN_TOOLS: tools only an MCP agent calls are
+ * not offered to the model.
+ */
+const MODEL_TOOLS: Anthropic.Tool[] = BRAIN_MODEL_TOOLS.map(toModelTool)
+const CONFIRM_MODEL_TOOLS: Anthropic.Tool[] = MODEL_TOOLS.filter((t) => !CONFIRM_TOOL_BLOCKLIST.has(t.name))
+
+function toolsForIntent(intent: BrainIntent): Anthropic.Tool[] {
+  return intent === 'CONFIRM' ? CONFIRM_MODEL_TOOLS : MODEL_TOOLS
+}
+
+/** "I stopped before changing anything because …", ending with what can be done next. */
+function nothingChangedBecause(failure: ModelFailure): string {
+  return (
+    `I stopped before changing anything because ${failure.reason}. Nothing was modified.` +
+    (failure.code === 'AI_UNAVAILABLE'
+      ? ' The typed tools do not need AI and still work.'
+      : failure.retryable
+        ? ' Please try again in a moment.'
+        : '')
+  )
 }
 
 /**
- * One model call with a single retry on transient failure (timeout / 429 /
- * 5xx / connection reset). A second failure rethrows so the loop can fall
- * back to a truthful summary instead of pretending nothing happened.
+ * A turn that could not get a model to answer at all. Nothing was changed, so
+ * it says exactly that and why, instead of carrying on into a step that would
+ * fail somewhere less explicable. `detail` is the deployment's own account of
+ * the problem (which setting is missing), shown after the summary.
  */
-async function callModelWithRetry(
-  openai: Pick<OpenAI, 'chat'>,
-  messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
-  tools: OpenAI.Chat.Completions.ChatCompletionTool[] = BRAIN_MODEL_TOOLS,
-): Promise<OpenAI.Chat.Completions.ChatCompletion> {
-  const params = {
-    model: getModel('respond'),
-    messages,
-    tools,
-    tool_choice: 'auto' as const,
-    temperature: 0.1,
-    max_tokens: 1500,
-  }
-  // The shared client's 30s timeout is sized for small classify/summarize
-  // calls. Agent-loop requests carry 10–20k input tokens (understanding block
-  // + conversation + tool transcript) and routinely exceed 30s under load —
-  // that timeout is what turned the 2026-07-03 Founder Outreach build into a
-  // "model error" loop. 90s per request here; the retry keeps total bounded.
-  const perRequest = { timeout: 90_000 }
-  try {
-    return await openai.chat.completions.create(params, perRequest)
-  } catch (err) {
-    const e = err as any
-    const transient =
-      e?.status === 429 ||
-      e?.status === 408 ||
-      (typeof e?.status === 'number' && e.status >= 500) ||
-      e?.code === 'ECONNRESET' ||
-      e?.code === 'ETIMEDOUT' ||
-      /timeout|timed out/i.test(e?.message ?? '')
-    if (!transient) throw err
-    console.warn('[Brain] transient model error — retrying once:', e?.status ?? e?.code ?? e?.message)
-    await new Promise((r) => setTimeout(r, 1500))
-    return await openai.chat.completions.create(params, perRequest)
+function stoppedBeforeStarting(
+  failure: ModelFailure,
+  emit: (e: BrainEvent) => void,
+  toolsRun: string[],
+  detail?: string,
+): BrainResult {
+  const summary = nothingChangedBecause(failure) + (detail ? `\n\n${detail}` : '')
+  emit({ type: 'error', message: `No model call could be made: ${failure.reason}.` })
+  emit({ type: 'final', summary, needsUser: false })
+  return {
+    success: false,
+    summary,
+    needsUser: false,
+    iterations: 0,
+    toolsRun,
+    classification: { intent: 'UNCLEAR', confidence: 0, reasoning: `not classified: ${failure.reason}` },
+    tokensUsed: 0,
+    failureCode: failure.code,
+    retryable: failure.retryable,
+    applied: [],
   }
 }
 
@@ -1672,32 +1746,41 @@ function buildIntentHint(intent: BrainIntent): string {
  * `…and save "?` mid-word. Falls back to a non-truncating generic question
  * only if the model call fails.
  */
+/** The clarification's shape, as structured output: every object closed, every field required. */
+const CLARIFICATION_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['question', 'options'],
+  properties: {
+    question: { type: 'string' },
+    options: { type: 'array', items: { type: 'string' } },
+  },
+}
+
 async function synthesiseClarification(
   message: string,
   recentHistory: ConversationTurn[],
+  projectId: string,
 ): Promise<{ question: string; options: string[] }> {
   const fallback = {
     question: 'Just so I get this right — do you want me to build this backend for you, change something that already exists, or answer a question about how Backenly works?',
     options: ['Build it for me', 'Change something existing', 'Answer a question'],
   }
   try {
-    const openai = getOpenAIClient()
-    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
-      { role: 'system', content: clarifyPrompt() },
-    ]
-    for (const turn of recentHistory.slice(-4)) {
-      messages.push({ role: turn.role, content: turn.content.length > 600 ? turn.content.slice(0, 600) + '…' : turn.content })
-    }
-    messages.push({ role: 'user', content: message })
-    const completion = await openai.chat.completions.create({
-      model: getModel('classify'),
-      messages,
-      temperature: 0.2,
-      max_tokens: 160,
-      response_format: { type: 'json_object' },
+    const recent = recentHistory.slice(-4).map((turn) => ({
+      role: turn.role,
+      content: turn.content.length > 600 ? turn.content.slice(0, 600) + '…' : turn.content,
+    }))
+    const reply = await generate({
+      purpose: 'brain.classify',
+      system: clarifyPrompt(),
+      messages: conversationFor(recent, message),
+      jsonSchema: CLARIFICATION_SCHEMA,
+      maxTokens: 400,
+      billing: { projectId },
+      label: 'brain-clarify',
     })
-    const raw = completion.choices[0]?.message?.content?.trim() ?? ''
-    const parsed = JSON.parse(raw) as { question?: unknown; options?: unknown }
+    const parsed = (reply.json ?? {}) as { question?: unknown; options?: unknown }
     const question = typeof parsed.question === 'string' && parsed.question.trim() ? parsed.question.trim() : fallback.question
     const options = Array.isArray(parsed.options)
       ? parsed.options.filter((o): o is string => typeof o === 'string' && o.trim().length > 0).slice(0, 3)
