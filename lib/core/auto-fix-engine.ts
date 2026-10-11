@@ -30,7 +30,7 @@ import {
 } from '@/lib/execution/sql-recorder'
 import { classifyFix } from './fix-classifier'
 import { checkBreaker, auditBreakerTrip } from '@/lib/autonomy/circuit-breaker'
-import { evaluateFixOutcome, captureCheckBaseline } from '@/lib/autonomy/desired-state'
+import { evaluateFixOutcome, captureCheckBaseline, type FixOutcome } from '@/lib/autonomy/desired-state'
 import { FLAGS } from '@/lib/config/flags'
 import { withBuildLock } from '@/lib/ai/build-runtime/build-lock'
 import { normalizeFindingType } from './types'
@@ -400,6 +400,8 @@ export async function executeApprovedFix(
   rollbackData?: Record<string, unknown>
   /** Whether the gap was re-probed after the fix and confirmed gone. */
   verification?: FixVerification
+  /** Whether other guarantees were compared before and after the fix. */
+  regressionCheck?: FixOutcome['regressionCheck']
 }> {
   const finding = await prisma.healthFinding.findUnique({ where: { id: findingId } })
   if (!finding) return { success: false, message: 'Finding not found.' }
@@ -509,7 +511,13 @@ export async function executeApprovedFix(
   const pre = await capturePreFixState(projectId, baseType, fixAction)
 
   // Baseline for the acceptance gate below (see the autonomous path for why).
-  const baseline = await captureCheckBaseline(projectId).catch(() => null)
+  // A failed capture is kept rather than swallowed, so the record says
+  // collateral damage was not checked instead of implying nothing broke.
+  let baselineError: string | null = null
+  const baseline = await captureCheckBaseline(projectId).catch((err: unknown) => {
+    baselineError = err instanceof Error ? err.message : String(err)
+    return null
+  })
 
   // Retry on transient lock contention. A human clicked Approve — the right
   // behaviour is to WAIT for the lock, not bounce the wait back to the user.
@@ -601,6 +609,7 @@ export async function executeApprovedFix(
   // likely to be approving by hand — the auth pair, whose fix rewires sign-in for
   // every end-user of the project.
   let verification: FixVerification = 'unverified'
+  let regressionCheck: FixOutcome['regressionCheck'] = 'unavailable'
   {
     // Same three-outcome rule as the autonomous path. The verifier throwing is
     // not the fix failing and is not the fix working, and a human who clicked
@@ -650,6 +659,7 @@ export async function executeApprovedFix(
       }
     }
     if (outcome?.recheck === 'resolved') verification = 'confirmed'
+    regressionCheck = outcome?.regressionCheck ?? 'unavailable'
   }
 
   // Post-fix snapshot: version history only — never the undo target.
@@ -673,6 +683,10 @@ export async function executeApprovedFix(
     schemaTouching: pre.schemaTouching,
     fixedAt: new Date().toISOString(),
     verification,
+    // Whether other guarantees were compared before and after. 'unavailable'
+    // means nobody looked, so no claim of "nothing else broke" may be made.
+    regressionCheck,
+    ...(baselineError ? { baselineError } : {}),
   }
 
   return {
@@ -681,6 +695,7 @@ export async function executeApprovedFix(
     snapshotId: pre.preSnapshotId ?? undefined,
     rollbackData,
     verification,
+    regressionCheck,
   }
 }
 
@@ -1162,8 +1177,12 @@ async function _executeAutoFix(
   // can tell "this fix broke something" from "this was already broken". Without
   // a before-state there is nothing to compare against and a regression is
   // indistinguishable from a pre-existing failure, so the gate degrades to
-  // target-only verification rather than guessing.
-  const baseline = await captureCheckBaseline(projectId).catch(() => null)
+  // target-only verification rather than guessing, and the record says so.
+  let baselineError: string | null = null
+  const baseline = await captureCheckBaseline(projectId).catch((err: unknown) => {
+    baselineError = err instanceof Error ? err.message : String(err)
+    return null
+  })
 
   let result
   installSqlRecorder(prisma as any)
@@ -1261,6 +1280,7 @@ async function _executeAutoFix(
   // A timeout does not prove the fix failed. It also does not prove it worked.
   // So the error case is its own state and is never success.
   let verification: FixVerification = 'unverified'
+  let regressionCheck: FixOutcome['regressionCheck'] = 'unavailable'
   {
     let verifierError: string | null = null
     const outcome = await evaluateFixOutcome(projectId, type, details, baseline).catch(
@@ -1308,6 +1328,7 @@ async function _executeAutoFix(
         recovered ? `${outcome.reason} ${recovered}` : outcome.reason)
     }
     if (outcome?.recheck === 'resolved') verification = 'confirmed'
+    regressionCheck = outcome?.regressionCheck ?? 'unavailable'
   }
 
   // Post-fix snapshot: version history / diff surface only — NEVER the undo
@@ -1332,6 +1353,10 @@ async function _executeAutoFix(
     schemaTouching: pre.schemaTouching,
     fixedAt: new Date().toISOString(),
     verification,
+    // Whether other guarantees were compared before and after. 'unavailable'
+    // means nobody looked, so no claim of "nothing else broke" may be made.
+    regressionCheck,
+    ...(baselineError ? { baselineError } : {}),
   }
 
   await prisma.healthFinding.update({
@@ -1364,6 +1389,7 @@ async function _executeAutoFix(
     statements,
     // Read by the trust scoreboard: only 'confirmed' fixes count as verified.
     verification,
+    regressionCheck,
   })
 
   return { findingId, outcome: 'auto_fixed', message: result.message, rollbackData }

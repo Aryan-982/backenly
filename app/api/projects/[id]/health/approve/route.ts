@@ -157,6 +157,8 @@ export const POST = withProjectAccess(async (req: NextRequest, { user, project, 
         statements: (result.rollbackData as Record<string, unknown> | undefined)?.statements ?? [],
         // Drives the ledger copy: only 'confirmed' may claim re-verification.
         verification: result.verification ?? 'unverified',
+        // Only 'ran' may claim nothing else broke.
+        regressionCheck: result.regressionCheck ?? 'unavailable',
       }),
       timestamp: new Date(),
     },
