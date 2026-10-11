@@ -158,6 +158,8 @@ export function validateAnswer(
   answer: Pick<Investigation, 'verdict' | 'evidenceRefs' | 'namedTables' | 'namedColumns'>,
   evidence: EvidenceEntry[],
   catalog: CatalogTable[],
+  /** Columns the finding itself is about ("table.column"), which may not exist yet: a missing column. */
+  subjects: string[] = [],
 ): { ok: boolean; problems: string[] } {
   const problems: string[] = []
   const seen = new Set(['finding', ...evidence.map((e) => e.id)])
@@ -166,6 +168,7 @@ export function validateAnswer(
   for (const t of answer.namedTables) if (!tables.has(t)) problems.push(`names table "${t}", which does not exist`)
   for (const c of answer.namedColumns) {
     const [t, col] = c.split('.')
+    if (subjects.includes(c) && tables.has(t)) continue
     if (!col || !tables.get(t)?.has(col)) problems.push(`names column "${c}", which does not exist`)
   }
   if (answer.verdict === 'explained' && answer.evidenceRefs.length === 0) problems.push('claims an explanation without citing evidence')
@@ -197,7 +200,9 @@ export async function investigateFinding(input: InvestigationInput, runProbe: Pr
     const calls = reply.message.content.filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use')
     if (calls.length === 0) {
       const a = reply.json as Omit<Investigation, 'evidence' | 'validation' | 'model'>
-      const validation = validateAnswer(a, evidence, input.catalog)
+      const d = input.finding.details
+      const subjects = typeof d.tableName === 'string' && typeof d.columnName === 'string' ? [`${d.tableName}.${d.columnName}`] : []
+      const validation = validateAnswer(a, evidence, input.catalog, subjects)
       return {
         ...a,
         verdict: validation.ok ? a.verdict : 'uncertain',

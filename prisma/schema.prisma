@@ -177,6 +177,7 @@ model Project {
   deployConfirmations     DeployConfirmation[]
   aiConfiguration         AiConfiguration?
   aiUsage                 AiUsage[]
+  aiFixProposals          AiFixProposal[]
   anomalies               Anomaly[]
   apiKeys                 ApiKey[]
   apiRequestLogs          ApiRequestLog[]
@@ -1295,6 +1296,40 @@ model AiSpendPeriod {
 
   @@id([month, scope])
   @@map("ai_spend_periods")
+}
+
+/// A repair an AI investigation proposed for one finding, bound to the exact
+/// evidence, parameters and catalog state it was proposed against. It runs only
+/// when a person approves that exact version (lib/autonomy/ai-proposals.ts),
+/// and only once: approval claims it with a conditional update.
+model AiFixProposal {
+  id                  String    @id @default(uuid())
+  projectId           String
+  findingId           String
+  /// pending | executing | executed | failed | rejected | stale | expired
+  status              String    @default("pending")
+  action              String
+  params              Json
+  /// Binds project, finding, evidence, action, params, the touched catalog,
+  /// the rollback contract and the verifier version. Approval must present it.
+  proposalVersion     String
+  evidenceFingerprint String
+  catalogFingerprint  String
+  model               String
+  rationale           String    @db.Text
+  expiresAt           DateTime
+  /// Set by the one approval that claimed it.
+  executionId         String?
+  decidedBy           String?
+  decidedAt           DateTime?
+  outcome             Json?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  project             Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, status])
+  @@index([findingId])
+  @@map("ai_fix_proposals")
 }
 
 /// One call's reservation. A call that never settles (the process died) is
