@@ -32,7 +32,16 @@ const ROUTES: Record<AiPurpose, Omit<PurposeRoute, 'model'>> = {
   'brain.architect':      { thinking: false, effort: 'high',   maxTokens: 16000, timeoutMs: 180_000 },
   'brain.agent':          { thinking: true,  effort: 'high',   maxTokens: 16000, timeoutMs: 180_000 },
   'build.fix_author':     { thinking: true,  effort: 'high',   maxTokens: 16000, timeoutMs: 180_000 },
+  // The older build and orchestration pipelines: short structured judgements,
+  // and longer JSON plans. Their prompts ask for JSON and are parsed as such.
+  'build.classify':       { thinking: false, effort: 'low',    maxTokens: 4096,  timeoutMs: 60_000 },
+  'build.plan':           { thinking: false, effort: 'medium', maxTokens: 16000, timeoutMs: 180_000 },
   'functions.generate':   { thinking: true,  effort: 'high',   maxTokens: 16000, timeoutMs: 180_000 },
+  // Explanations a person reads: impact, guidance, simulations, the assistant.
+  'insight.explain':      { thinking: false, effort: 'medium', maxTokens: 4096,  timeoutMs: 90_000 },
+  // A short written diagnosis of an escalated finding, after the deterministic
+  // investigation could not conclude. The investigator proper is autonomy.investigate.
+  'autonomy.diagnose':    { thinking: false, effort: 'medium', maxTokens: 4096,  timeoutMs: 90_000 },
   'autonomy.investigate': { thinking: true,  effort: 'max',    maxTokens: 32000, timeoutMs: 300_000 },
   'runtime.generate':     { thinking: false, effort: 'medium', maxTokens: 4096,  timeoutMs: 60_000 },
 }
@@ -94,9 +103,11 @@ function openaiDefault(purpose: AiPurpose, env: Env): string {
   switch (purpose) {
     case 'brain.classify':
     case 'brain.summary':
+    case 'build.classify':
       return set(env.OPENAI_MODEL_FAST) ?? 'gpt-4o-mini'
     case 'build.fix_author':
       return set(env.AUTONOMY_FIX_MODEL) ?? 'gpt-4o'
+    case 'autonomy.diagnose':
     case 'autonomy.investigate':
       return set(env.AUTONOMY_DIAGNOSIS_MODEL) ?? 'gpt-4o'
     default:
