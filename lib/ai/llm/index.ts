@@ -57,6 +57,15 @@ export function setProviderForTests(provider: LlmProvider | null): void {
 }
 
 /**
+ * The provider calls go to right now: a test's, or the configured one. The
+ * lab's live arm wraps it to count calls. Throws not_configured when there is
+ * none.
+ */
+export function activeProvider(): LlmProvider {
+  return currentProvider()
+}
+
+/**
  * Whether a call can be made here, and if not, a sentence saying why: the
  * configured provider, or the one a test put in its place. Configuration only;
  * a configured provider can still fail.
