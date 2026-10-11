@@ -4510,8 +4510,8 @@ async function executeCreateTable(
 
     // ── Domain endpoint generation ────────────────────────────────────────────
     // The table's CRUD surface needs no registration step: under PostgREST the
-    // API IS the schema, so `/db/{tableName}` is live the moment the table
-    // exists, resolved from the PostgreSQL catalog per request.
+    // `/db/{tableName}` is served from PostgREST's schema cache, which reloads
+    // after DDL. The runtime retries requests that arrive during that reload.
     //
     // executeGenerateAPI is still called because it also authors the DOMAIN
     // endpoints for this table (the business-logic functions CRUD cannot
@@ -7815,13 +7815,13 @@ async function executeGetErrors(params: any, projectId: string): Promise<Executi
  */
 async function executeGetUsage(projectId: string): Promise<ExecutionResult> {
   try {
-    const { prisma } = await import('@/lib/db')
-    const project = await prisma.project.findUnique({ where: { id: projectId }, select: { userId: true } })
-    if (!project?.userId) {
+    const { billingAccountOf } = await import('@/lib/usage/account')
+    const account = await billingAccountOf(projectId)
+    if (!account) {
       return { success: false, message: 'This project has no owning account to read usage for.' }
     }
     const { describeAccountUsage } = await import('@/lib/usage/describe')
-    const usage = await describeAccountUsage(project.userId)
+    const usage = await describeAccountUsage(account)
     if (!usage) {
       return { success: false, message: 'No plan is attached to the account that owns this project, so there is no usage to read.' }
     }

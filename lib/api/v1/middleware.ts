@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { clientIpFromHeaders } from '@/lib/security/client-ip'
 import { authenticateApiKey } from '@/lib/middleware/apiKeyAuth'
 import { prisma } from '@/lib/db'
 import { createErrorResponse, ErrorCodes } from './errors'
@@ -14,6 +15,13 @@ import { PAUSED_CODE, PAUSED_MESSAGE, pausedDetails } from '@/lib/projects/servi
 import { touchProjectActivity } from '@/lib/projects/activity'
 import jwt from 'jsonwebtoken'
 import { resolveJwtSecret } from '@/lib/services/jwtSecretManager'
+import {
+  SERVICE_ROLE_IN_BROWSER,
+  detectBrowserOrigin,
+  recordServiceRoleBrowserBlock,
+  serviceRoleRefusalMessage,
+} from '@/lib/security/service-role-exposure'
+import { MCP_KEY_HINT, MCP_KEY_IN_APP, isMcpCredential, mcpKeyRefusalMessage } from '@/lib/security/key-placement'
 
 import { INTERNAL_DOMAINS, isInternalOrigin } from '@/lib/security/internal-origin'
 
@@ -117,7 +125,7 @@ export async function v1ApiMiddleware(
         kind: 'auth_failure',
         severity: 'info',
         projectId: params.projectId,
-        ip: request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? null,
+        ip: clientIpFromHeaders(request),
         summary: `Auth failed (${fr?.kind ?? 'unknown'}) from ${origin ?? 'unknown origin'}`,
         detail: {
           kind: fr?.kind ?? 'unknown',
@@ -174,7 +182,7 @@ export async function v1ApiMiddleware(
       severity: 'warn',
       userId: apiKeyRecord.userId,
       projectId: params.projectId,
-      ip: request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? null,
+      ip: clientIpFromHeaders(request),
       summary: `Rate limit hit on project ${params.projectId} (key ${apiKeyRecord.keyPrefix})`,
       detail: { apiKeyId: apiKeyRecord.id, path: request.nextUrl.pathname, limit: apiKeyRecord.rateLimit },
     }).catch(() => {})
@@ -238,7 +246,7 @@ export async function v1ApiMiddleware(
       kind: 'lockdown',
       severity: 'high',
       projectId,
-      ip: request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? null,
+      ip: clientIpFromHeaders(request),
       summary: `Public request blocked — project "${project.name}" is locked down`,
       detail: { path: request.nextUrl.pathname, method: request.method },
     }).catch(() => {})
@@ -337,7 +345,20 @@ export async function v1ApiMiddleware(
     // We'll verify project access via API key's projectId in step 6
   }
 
-  // 4. Only public keys can access /v1 routes
+  // 4. Only public keys can access /v1 routes. An MCP key is named first: the
+  // generic wording below ("Dashboard keys") describes a different credential
+  // and sent agents looking for one. lib/security/key-placement.ts.
+  if (isMcpCredential(apiKeyRecord)) {
+    return {
+      context: {} as V1ApiContext,
+      response: createErrorResponse(
+        MCP_KEY_IN_APP,
+        mcpKeyRefusalMessage(apiKeyRecord.name ?? null),
+        403,
+        { hint: MCP_KEY_HINT },
+      ),
+    }
+  }
   if (apiKeyRecord.keyType !== 'public') {
     return {
       context: {} as V1ApiContext,
@@ -370,7 +391,7 @@ export async function v1ApiMiddleware(
       severity: 'high',
       userId: apiKeyRecord.userId,
       projectId,
-      ip: request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? null,
+      ip: clientIpFromHeaders(request),
       summary: `API key scoped to ${apiKeyRecord.projectId} used against project ${projectId}`,
       detail: { apiKeyId: apiKeyRecord.id, keyProjectId: apiKeyRecord.projectId, requestedProjectId: projectId, path: request.nextUrl.pathname },
     }).catch(() => {})
@@ -381,6 +402,33 @@ export async function v1ApiMiddleware(
         'API key does not have access to this project',
         403
       ),
+    }
+  }
+
+  // 7. A service-role key never answers a browser.
+  //
+  // The Express runtime has refused this since the guard was written; the Next
+  // surfaces (storage, functions, stats, the rest) never did, so a service-role
+  // key in a frontend was refused on /db and served on /storage. recordedV1
+  // refuses it at the door, before authenticateApiKey above spends the key's
+  // rate limit; this is the same rule for a request the door let through because
+  // its lookup failed.
+  if (apiKeyRecord.serviceRole) {
+    const verdict = detectBrowserOrigin(Object.fromEntries(request.headers))
+    if (verdict.isBrowser) {
+      recordServiceRoleBrowserBlock({
+        projectId,
+        apiKeyId: apiKeyRecord.id,
+        keyName: apiKeyRecord.name ?? null,
+        keyPrefix: apiKeyRecord.keyPrefix ?? null,
+        verdict,
+        method: request.method,
+        path: request.nextUrl.pathname,
+      }).catch(() => {})
+      return {
+        context: {} as V1ApiContext,
+        response: createErrorResponse(SERVICE_ROLE_IN_BROWSER, serviceRoleRefusalMessage(apiKeyRecord.name ?? null), 403),
+      }
     }
   }
 
