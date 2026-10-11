@@ -1,5 +1,7 @@
 # Retiring the agent orchestrator from autonomy: detector parity
 
+> The orchestrator, its governor and its four agents have since been deleted. The paths below name files that no longer exist; this page is the record of why they could go.
+
 The background monitor (`lib/ai/background-monitor.ts`) runs two detect-and-fix pipelines.
 
 1. **The canonical loop.** The desired-state invariants feed the reconciler, which hands repairs to the auto-fix kernel. Each repair is re-checked against the live database, and its outcome is recorded.

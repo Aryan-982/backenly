@@ -22,9 +22,11 @@
  * covered in docs/autonomy-orchestrator-parity.md; the drift detectors that
  * replace it have their own suites.
  *
- * Where a section runs a retired agent, it is to show the false finding happens
- * rather than to assert it from reading the agent's code. Those halves leave
- * with the agents.
+ * The agents themselves are deleted. The sections that ran them, to show each
+ * false finding happening rather than asserting it from the agent's code, left
+ * with them; what they showed is recorded in docs/autonomy-orchestrator-parity.md.
+ * The canonical halves stay, so a canonical detector that stops covering one of
+ * these cases fails here.
  */
 
 import { PrismaClient } from '@prisma/client'
@@ -32,8 +34,6 @@ import { randomUUID } from 'crypto'
 import { detectMissingRls, detectRlsDeniesEverything } from '@/lib/services/workspace-observer'
 import { detectMissingFkIndexes, checkAuthIntegrity } from '@/lib/core/drift-detector'
 import { probeCoveredTypes } from '@/lib/autonomy/desired-state'
-import { runSecurityAgent } from '@/lib/ai/agents/security-agent'
-import { runRepairAgent } from '@/lib/ai/agents/repair-agent'
 
 // The security agent ends with a model review. Without a key it cannot run, so
 // these tests never reach a provider.
@@ -45,13 +45,11 @@ const q = (sql: string) => prisma.$executeRawUnsafe(sql)
 let userId: string
 let projectId: string
 let schema: string
-let tables: string[] = []
 
 /** Create a table a client role can read, as every platform table is. */
 async function table(name: string, columns: string) {
   await q(`CREATE TABLE "${schema}"."${name}" (${columns})`)
   await q(`GRANT SELECT ON "${schema}"."${name}" TO authenticated`).catch(() => {})
-  tables.push(name)
 }
 
 beforeAll(async () => {
@@ -115,14 +113,6 @@ describe('row security', () => {
     expect(tablesIn(await detectRlsDeniesEverything(projectId)).has('orders')).toBe(true)
   }, 60_000)
 
-  it('the retired agent reports that same table as readable by anyone, and misses the exposed ones', async () => {
-    const res = await runSecurityAgent({ projectId, tables })
-    const rls = res.findings.filter((f) => f.category === 'missing_rls')
-    const orders = rls.find((f) => f.location === 'orders')
-    expect(orders?.description).toMatch(/Any authenticated user can read all rows/)
-    expect(rls.some((f) => f.location === 'invoices')).toBe(false)
-    expect(rls.some((f) => f.location === 'payments')).toBe(false)
-  }, 60_000)
 })
 
 // ── security: auth_gap ────────────────────────────────────────────────────────
@@ -132,13 +122,6 @@ describe('end-user auth', () => {
     const types = (await checkAuthIntegrity(projectId)).map((f) => f.type)
     expect(types).not.toContain('auth_users_table_missing')
     expect(types).not.toContain('auth_jwt_missing')
-  }, 60_000)
-
-  it('the retired agent says end users cannot sign in, on the same project', async () => {
-    // The users table is created by the first sign-up, so its absence is the
-    // normal state of a backend nobody has signed up to yet.
-    const res = await runSecurityAgent({ projectId, tables })
-    expect(res.findings.some((f) => f.category === 'auth_gap')).toBe(true)
   }, 60_000)
 
   it('canonical files the missing users table once auth is configured', async () => {
@@ -215,11 +198,6 @@ describe('a foreign key to a table that no longer exists', () => {
 // ── repair: realtime triggers ────────────────────────────────────────────────
 
 describe('realtime triggers', () => {
-  it('the retired agent files a defect against every project that has not turned realtime on', async () => {
-    const res = await runRepairAgent({ projectId, tables })
-    expect(res.findings.some((f) => f.category === 'missing_realtime_triggers')).toBe(true)
-  }, 60_000)
-
   it('canonical has no realtime finding to repeat it with', () => {
     // Turning realtime on for a table IS installing its trigger
     // (lib/services/realtimeTriggers.ts), so no trigger means realtime is off,

@@ -10,8 +10,8 @@
  * then the auto-fix kernel, whose every repair is re-checked against the live
  * database before anything calls it fixed.
  *
- * It used to run a second pipeline first, the agent orchestrator
- * (lib/ai/agent-orchestrator.ts). That pipeline filed its own findings, applied
+ * It used to run a second pipeline first, the agent orchestrator (since
+ * deleted with its agents). That pipeline filed its own findings, applied
  * fixes through its own connection pool without a re-check, and announced
  * "Auto-fixed N backend issue(s)". Every real problem it found is found by the
  * canonical detectors, and its other findings were not real problems
