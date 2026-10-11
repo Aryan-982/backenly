@@ -44,6 +44,15 @@ function sentence(v: unknown): string | undefined {
 /** Render a finding's type + details as one user-facing sentence. */
 export function summariseFinding(type: string, details: Details): string {
   const d = (details ?? {}) as Record<string, unknown>
+  const text = summariseFindingText(type, d)
+  // Filed by the retired agent orchestrator. The only such findings still
+  // listed are ones someone already acted on (lib/core/finding-reaper.ts), and
+  // no current check stands behind them, so say where they came from.
+  return typeof d.agentType === 'string' ? `From a retired check: ${text}` : text
+}
+
+function summariseFindingText(type: string, details: Record<string, unknown>): string {
+  const d = details
   const norm = normalizeFindingType(type, d)
   const table =
     norm?.tableName ?? str(d.tableName) ?? str(d.table) ?? str(d.name)
@@ -261,6 +270,7 @@ export function summariseFinding(type: string, details: Details): string {
     sentence(d.reason) ??
     sentence(d.message) ??
     sentence(d.detail) ??
+    sentence(d.title) ??
     type.replace(/_/g, ' ')
   )
 }

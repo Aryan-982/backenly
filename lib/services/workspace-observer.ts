@@ -756,12 +756,12 @@ async function observeProject(projectId: string, result: ObserverResult): Promis
   try {
     const { reapStaleFindings } = await import('@/lib/core/finding-reaper')
     const reaped = await reapStaleFindings(projectId)
-    const total = reaped.arch + reaped.performance + reaped.invariants + reaped.migration
+    const total = reaped.arch + reaped.retired + reaped.invariants + reaped.drift
     if (total > 0) {
       console.log(
         `[WorkspaceObserver] reaped stale findings for ${projectId}: ` +
-        `arch=${reaped.arch} performance=${reaped.performance} ` +
-        `invariants=${reaped.invariants} migration=${reaped.migration}`,
+        `arch=${reaped.arch} retired=${reaped.retired} ` +
+        `invariants=${reaped.invariants} drift=${reaped.drift}`,
       )
     }
   } catch { /* best-effort — a failed reap must never fail the scan */ }
