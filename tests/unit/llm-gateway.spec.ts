@@ -10,9 +10,10 @@ import { aiAvailability, resolveProvider, routeFor, ALL_PURPOSES, BEDROCK_DEFAUL
 import { buildParams, shouldStream } from '@/lib/ai/llm/params'
 import { capsFor, canonicalModel, clampEffort } from '@/lib/ai/llm/models'
 import { AiError, classifyProviderError } from '@/lib/ai/llm/errors'
-import { generate, setProviderForTests, setRetryDelayForTests, normalizeUsage } from '@/lib/ai/llm'
+import { aiAvailability as gatewayAvailability, generate, setProviderForTests, setRetryDelayForTests, normalizeUsage } from '@/lib/ai/llm'
 import { scriptedMessage, scriptedProvider } from '@/lib/ai/llm/providers/scripted'
 import { memorySpendLedger, setSpendLedgerForTests } from '@/lib/ai/llm/spend'
+import { createTokenScope, runInTokenScope } from '@/lib/ai/token-meter'
 
 const user = (text: string): Anthropic.MessageParam => ({ role: 'user', content: text })
 
@@ -62,6 +63,14 @@ describe('routing', () => {
     expect(routeFor('brain.agent', 'bedrock', env).model).toBe('model-all')
   })
 
+  it('routes the architect without thinking and with room for a whole spec', () => {
+    expect(routeFor('brain.architect', 'bedrock', {})).toMatchObject({ thinking: false, effort: 'high', maxTokens: 16000 })
+    expect(routeFor('brain.answer', 'bedrock', {})).toMatchObject({ thinking: false, effort: 'medium' })
+    // On OpenAI both keep the model those calls always used: the smart one.
+    expect(routeFor('brain.architect', 'openai', { OPENAI_MODEL: 'smart' }).model).toBe('smart')
+    expect(routeFor('brain.answer', 'openai', { OPENAI_MODEL: 'smart' }).model).toBe('smart')
+  })
+
   it('keeps the older OpenAI variables working', () => {
     const env = { OPENAI_MODEL: 'smart', OPENAI_MODEL_FAST: 'fast', AUTONOMY_FIX_MODEL: 'fixer', AUTONOMY_DIAGNOSIS_MODEL: 'diag' }
     expect(routeFor('brain.classify', 'openai', env).model).toBe('fast')
@@ -102,6 +111,39 @@ describe('the request', () => {
     // Bedrock's Opus 4.6 integration rejects these with a 400.
     expect(p).not.toHaveProperty('cache_control')
     expect(p).not.toHaveProperty('temperature')
+  })
+
+  it("sends a call's own context as a second, uncached system block", () => {
+    const p = buildParams(route(), { purpose: 'brain.agent', system: 'S', context: 'C', messages: [user('x')] })
+    expect(p.system).toEqual([
+      { type: 'text', text: 'S', cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: 'C' },
+    ])
+  })
+
+  it("caches a tool loop's transcript at its last block, without marking the caller's messages", () => {
+    const tool: Anthropic.Tool = { name: 'a', input_schema: { type: 'object', properties: {} } }
+    const results: Anthropic.MessageParam = {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 't1', content: '{"ok":true}' }],
+    }
+    const messages: Anthropic.MessageParam[] = [
+      user('build it'),
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'a', input: {} }] },
+      results,
+    ]
+    const p = buildParams(route(), { purpose: 'brain.agent', system: 'S', tools: [tool], messages, cacheConversation: true })
+    const last = p.messages[p.messages.length - 1].content as Array<Record<string, unknown>>
+    expect(last[0].cache_control).toEqual({ type: 'ephemeral' })
+    // The transcript the loop keeps appending to stays unmarked, so the next
+    // call moves the breakpoint forward instead of piling them up.
+    expect((results.content as Array<Record<string, unknown>>)[0].cache_control).toBeUndefined()
+    // System, last tool, last message: three of the four the API allows.
+    expect(JSON.stringify(p).split('"cache_control"').length - 1).toBe(3)
+
+    // A plain-text last message becomes a block so it can carry the marker.
+    const q = buildParams(route(), { purpose: 'brain.agent', messages: [user('hi')], cacheConversation: true })
+    expect(q.messages[0].content).toEqual([{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }])
   })
 
   it('thinks only where the purpose asks, and never with a forced tool', () => {
@@ -186,6 +228,43 @@ describe('generate', () => {
     const e = await generate({ purpose: 'brain.classify', messages: [user('x')] }).catch((x) => x)
     expect(e).toMatchObject({ kind: 'timeout', consumption: 'unknown', attempts: 1 })
     expect(provider.calls).toHaveLength(1)
+  })
+
+  it('reports every call that ran to the open credit meter, in cost-weighted tokens', async () => {
+    setProviderForTests(
+      scriptedProvider([
+        scriptedMessage({ text: 'a', usage: { input_tokens: 100, output_tokens: 20, cache_creation_input_tokens: 4000 } }),
+        scriptedMessage({ text: '', stopReason: 'refusal', usage: { input_tokens: 50, output_tokens: 10, cache_read_input_tokens: 4000 } }),
+      ]),
+    )
+    const scope = createTokenScope()
+    await runInTokenScope(scope, async () => {
+      await generate({ purpose: 'brain.agent', messages: [user('x')] })
+      await generate({ purpose: 'brain.agent', messages: [user('y')] }).catch(() => {})
+    })
+    // 100 + 4000 written at 1.25 + 20 out; then a refusal, which still ran:
+    // 50 + 4000 read at 0.1 + 10 out.
+    expect(scope.tokens).toBe(5120 + 460)
+  })
+
+  it('reports nothing for a call the provider refused before running it', async () => {
+    setProviderForTests(scriptedProvider([new Anthropic.PermissionDeniedError(403, {}, 'no access', new Headers())]))
+    const scope = createTokenScope()
+    await runInTokenScope(scope, () => generate({ purpose: 'brain.agent', messages: [user('x')] }).catch(() => undefined))
+    expect(scope.tokens).toBe(0)
+  })
+
+  it('names the model a failed request was routed to, so a run it cost can be priced', async () => {
+    setProviderForTests(scriptedProvider([scriptedMessage({ text: '', stopReason: 'refusal' })]))
+    const e = await generate({ purpose: 'brain.agent', messages: [user('x')] }).catch((x) => x)
+    expect(e.model).toBe(routeFor('brain.agent', 'anthropic').model)
+  })
+
+  it("counts a test's scripted provider as configured", () => {
+    setProviderForTests(scriptedProvider([]))
+    expect(gatewayAvailability({})).toEqual({ available: true, provider: 'scripted' })
+    setProviderForTests(null)
+    expect(gatewayAvailability({})).toMatchObject({ available: false })
   })
 
   it('fails as not configured, with the reason, when nothing is set up', async () => {

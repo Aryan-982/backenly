@@ -26,6 +26,10 @@ export const ANTHROPIC_DEFAULT_MODEL = 'claude-opus-4-6'
 const ROUTES: Record<AiPurpose, Omit<PurposeRoute, 'model'>> = {
   'brain.classify':       { thinking: false, effort: 'low',    maxTokens: 1024,  timeoutMs: 30_000 },
   'brain.summary':        { thinking: false, effort: 'low',    maxTokens: 2048,  timeoutMs: 60_000 },
+  'brain.answer':         { thinking: false, effort: 'medium', maxTokens: 2048,  timeoutMs: 60_000 },
+  // One long JSON design. No thinking: the spec is the plan, and a slow design
+  // call is what a chat turn's wall clock cuts.
+  'brain.architect':      { thinking: false, effort: 'high',   maxTokens: 16000, timeoutMs: 180_000 },
   'brain.agent':          { thinking: true,  effort: 'high',   maxTokens: 16000, timeoutMs: 180_000 },
   'build.fix_author':     { thinking: true,  effort: 'high',   maxTokens: 16000, timeoutMs: 180_000 },
   'functions.generate':   { thinking: true,  effort: 'high',   maxTokens: 16000, timeoutMs: 180_000 },

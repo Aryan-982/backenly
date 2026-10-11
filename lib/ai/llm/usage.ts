@@ -3,7 +3,7 @@
  */
 
 import type Anthropic from '@anthropic-ai/sdk'
-import { calculateCost } from '../cost-tracker'
+import { calculateCost, effectiveTokens } from '../cost-tracker'
 import type { NormalizedUsage } from './types'
 
 export function normalizeUsage(u: Anthropic.Usage | null | undefined): NormalizedUsage {
@@ -26,6 +26,17 @@ export function costOf(model: string, usage: NormalizedUsage): number {
   return calculateCost(model, usage.promptTokens, usage.outputTokens, usage.cacheReadTokens, {
     tokens5m: usage.cacheWrite5mTokens,
     tokens1h: usage.cacheWrite1hTokens,
+  })
+}
+
+/**
+ * Tokens weighted by what they cost at this model's cache prices: the unit AI
+ * credits are metered in (lib/ai/cost-tracker.ts effectiveTokens).
+ */
+export function effectiveTokensOf(model: string, usage: NormalizedUsage): number {
+  return effectiveTokens(usage.promptTokens, usage.outputTokens, usage.cacheReadTokens, {
+    model,
+    cacheWrite: { tokens5m: usage.cacheWrite5mTokens, tokens1h: usage.cacheWrite1hTokens },
   })
 }
 

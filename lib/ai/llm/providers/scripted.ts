@@ -10,7 +10,7 @@ import type { LlmProvider, SendOptions } from '../types'
 export type ScriptStep =
   | Anthropic.Message
   | Error
-  | ((params: Anthropic.MessageCreateParamsNonStreaming) => Anthropic.Message | Promise<Anthropic.Message>)
+  | ((params: Anthropic.MessageCreateParamsNonStreaming, opts: SendOptions) => Anthropic.Message | Promise<Anthropic.Message>)
 
 export interface ScriptedProvider extends LlmProvider {
   calls: Array<{ params: Anthropic.MessageCreateParamsNonStreaming; opts: SendOptions }>
@@ -27,13 +27,15 @@ export function scriptedProvider(steps: ScriptStep[]): ScriptedProvider {
       const step = queue.shift()
       if (step === undefined) throw new Error('scripted provider: no response left in the script')
       if (step instanceof Error) throw step
-      return typeof step === 'function' ? step(params) : step
+      return typeof step === 'function' ? step(params, opts) : step
     },
   }
 }
 
 /** A complete assistant message, with the fields a test usually sets. */
 export function scriptedMessage(m: {
+  /** A thinking block before everything else, as adaptive thinking produces. */
+  thinking?: string
   text?: string
   toolUse?: Array<{ id?: string; name: string; input: Record<string, unknown> }>
   stopReason?: Anthropic.StopReason
@@ -41,6 +43,7 @@ export function scriptedMessage(m: {
   usage?: Partial<{ input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }>
 }): Anthropic.Message {
   const content: unknown[] = []
+  if (m.thinking !== undefined) content.push({ type: 'thinking', thinking: m.thinking, signature: 'sig_scripted' })
   if (m.text !== undefined) content.push({ type: 'text', text: m.text, citations: null })
   for (const [i, t] of (m.toolUse ?? []).entries()) {
     content.push({ type: 'tool_use', id: t.id ?? `toolu_${i}`, name: t.name, input: t.input })

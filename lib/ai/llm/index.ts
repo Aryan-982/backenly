@@ -20,24 +20,28 @@
  *   - a failure is retried only when the provider rejected it before inference,
  *     so a retry can never run, and bill, a request twice;
  *   - usage comes back in one shape with cache reads and writes kept apart, and
- *     priced at the model's own cache rates (lib/ai/cost-tracker.ts).
+ *     priced at the model's own cache rates (lib/ai/cost-tracker.ts);
+ *   - every call that ran is reported to the credit meter of the request that
+ *     made it (lib/ai/token-meter.ts) and, with `billing.projectId`, written
+ *     to the project's usage log, so no call site has to remember either.
  */
 
 import type Anthropic from '@anthropic-ai/sdk'
-import { resolveProvider, routeFor, type ProviderConfig } from './config'
+import { recordAiUsage } from '../cost-tracker'
+import { recordTokens } from '../token-meter'
+import { aiAvailability as configuredAvailability, resolveProvider, routeFor, type ProviderConfig } from './config'
 import { AiError, classifyProviderError } from './errors'
 import { buildParams, shouldStream } from './params'
 import { anthropicProvider, bedrockProvider } from './providers/anthropic'
 import { openaiProvider } from './providers/openai'
 import { defaultPayer, reserveSpend, settleSpend } from './spend'
-import type { GenerateRequest, GenerateResult, LlmProvider, ProviderId, PurposeRoute } from './types'
-import { costOf, maxCostOf, normalizeUsage } from './usage'
+import type { GenerateRequest, GenerateResult, LlmProvider, NormalizedUsage, ProviderId, PurposeRoute } from './types'
+import { costOf, effectiveTokensOf, maxCostOf, normalizeUsage } from './usage'
 
 export type { AiPurpose, GenerateRequest, GenerateResult, NormalizedUsage, ProviderId } from './types'
 export { AiError } from './errors'
 export type { AiErrorKind, Consumption } from './errors'
-export { aiAvailability } from './config'
-export { normalizeUsage, costOf } from './usage'
+export { normalizeUsage, costOf, effectiveTokensOf } from './usage'
 
 const MAX_ATTEMPTS = 3
 /** Margin past the last attempt's timeout before an unsettled reservation is booked as unknown. */
@@ -50,6 +54,18 @@ let retryDelayMs = (attempt: number) => 500 * 2 ** (attempt - 1)
 /** Route every call to `provider` (a scripted one in tests). `null` restores configuration. */
 export function setProviderForTests(provider: LlmProvider | null): void {
   override = provider
+}
+
+/**
+ * Whether a call can be made here, and if not, a sentence saying why: the
+ * configured provider, or the one a test put in its place. Configuration only;
+ * a configured provider can still fail.
+ */
+export function aiAvailability(
+  env: Record<string, string | undefined> = process.env,
+): { available: true; provider: ProviderId } | { available: false; reason: string } {
+  if (override) return { available: true, provider: override.id }
+  return configuredAvailability(env)
 }
 
 export function setRetryDelayForTests(fn: ((attempt: number) => number) | null): void {
@@ -149,28 +165,52 @@ export async function generate(req: GenerateRequest): Promise<GenerateResult> {
     } catch (err) {
       const e = classifyProviderError(err, provider.id)
       e.attempts = attempt
+      if (!e.model) e.model = route.model
       if (e.retryable && e.consumption === 'none' && attempt < MAX_ATTEMPTS && !req.signal?.aborted) {
         await sleep(retryDelayMs(attempt))
         continue
       }
-      await settleFailure(reservation, e, route.model)
+      await settleFailure(reservation, e, route.model, req)
       throw e
     }
 
     try {
       const result = finish(message, provider.id, route, req, attempt)
+      recordRun(req, route.model, result.usage)
       await settleSpend(reservation, { consumption: 'ran', costUsd: result.costUsd, usage: result.usage })
       return result
     } catch (err) {
       const e = err instanceof AiError ? err : classifyProviderError(err, provider.id)
-      await settleFailure(reservation, e, route.model)
+      if (!e.model) e.model = route.model
+      await settleFailure(reservation, e, route.model, req)
       throw e
     }
   }
 }
 
-async function settleFailure(reservation: Awaited<ReturnType<typeof reserveSpend>>, e: AiError, model: string): Promise<void> {
+/**
+ * Account for a call that ran: its credit-weighted tokens go to the meter of
+ * whatever request opened one (a no-op outside a scope), and with a project its
+ * usage row is written. Never throws and never waits: the call has happened.
+ */
+function recordRun(req: GenerateRequest, model: string, usage: NormalizedUsage): void {
+  recordTokens(effectiveTokensOf(model, usage))
+  const projectId = req.billing?.projectId
+  if (!projectId) return
+  recordAiUsage(projectId, model, usage.promptTokens, usage.outputTokens, req.label ?? req.purpose, usage.cacheReadTokens, {
+    tokens5m: usage.cacheWrite5mTokens,
+    tokens1h: usage.cacheWrite1hTokens,
+  }).catch(() => {})
+}
+
+async function settleFailure(
+  reservation: Awaited<ReturnType<typeof reserveSpend>>,
+  e: AiError,
+  model: string,
+  req: GenerateRequest,
+): Promise<void> {
   if (e.consumption === 'ran' && e.usage) {
+    recordRun(req, model, e.usage)
     await settleSpend(reservation, { consumption: 'ran', costUsd: costOf(model, e.usage), usage: e.usage })
   } else if (e.consumption === 'none') {
     await settleSpend(reservation, { consumption: 'none' })

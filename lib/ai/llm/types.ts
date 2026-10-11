@@ -16,6 +16,8 @@ export type ProviderId = 'bedrock' | 'anthropic' | 'openai' | 'scripted'
 export type AiPurpose =
   | 'brain.classify'
   | 'brain.summary'
+  | 'brain.answer'
+  | 'brain.architect'
   | 'brain.agent'
   | 'build.fix_author'
   | 'functions.generate'
@@ -42,7 +44,19 @@ export interface GenerateRequest {
    * keep anything that changes per call (dates, ids, user input) out of here.
    */
   system?: string
+  /**
+   * Instructions for this call only (the project's current state, a retry
+   * note), sent as a second system block after `system`. Keeping them out of
+   * `system` is what lets the long stable prompt stay cached across calls.
+   */
+  context?: string
   messages: Anthropic.MessageParam[]
+  /**
+   * Also cache the conversation: a breakpoint on the last block of the last
+   * message, so the next call of a tool loop reads everything this one sent
+   * from the cache instead of paying for the growing transcript again.
+   */
+  cacheConversation?: boolean
   tools?: Anthropic.Tool[]
   toolChoice?: Anthropic.ToolChoice
   /** Lowers the purpose's output ceiling for this call; never raises it. */
@@ -55,8 +69,13 @@ export interface GenerateRequest {
    * everything else a customer's (lib/ai/llm/spend.ts).
    */
   payer?: 'customer' | 'platform'
-  /** The account a customer-paid call is held against and charged to. */
+  /**
+   * The account a customer-paid call is held against and charged to. With a
+   * `projectId`, every call that runs also writes a usage row for the project.
+   */
   billing?: { billingAccountId?: string; projectId?: string }
+  /** What made the call, recorded as the usage row's endpoint (e.g. 'brain-agent'). Defaults to the purpose. */
+  label?: string
 }
 
 /** Token counts in one shape for every provider. */
