@@ -1,9 +1,9 @@
 // lib/ai/agents/planner-agent.ts
 /** Planning agent: synthesizes multi-agent findings into a phased execution plan and a CTO-ready brief. */
 
-import OpenAI from 'openai'
 import type { AgentInput, AgentFinding, Phase, PlannerOutput } from './types'
 
+import { chat } from '@/lib/ai/llm/chat'
 // Severity ordering for sorting (lower = more urgent)
 const SEVERITY_ORDER: Record<string, number> = {
   critical: 0,
@@ -110,12 +110,6 @@ export async function planAgentResults(
   // ── 4. LLM CTO brief ─────────────────────────────────────────────────
   let ctoBrief = 'Backend health analysis complete.'
   try {
-    const openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-      timeout: 20_000,
-      maxRetries: 1,
-    })
-    const model = process.env.OPENAI_MODEL ?? 'gpt-4o-mini'
 
     const criticalCount = sorted.filter(f => f.severity === 'critical').length
     const highCount = sorted.filter(f => f.severity === 'high').length
@@ -128,10 +122,8 @@ export async function planAgentResults(
       `Top issues:\n${topTitles || '(none)'}\n\n` +
       `Write a crisp 2–3 sentence brief that names the most urgent risk and the single most important action to take first. No bullet points.`
 
-    const completion = await openai.chat.completions.create({
-      model,
-      max_tokens: 600,
-      temperature: 0.2,
+    const completion = await chat({
+      purpose: 'insight.explain',
       messages: [
         {
           role: 'system',
@@ -140,9 +132,11 @@ export async function planAgentResults(
         },
         { role: 'user', content: prompt },
       ],
+      maxTokens: 600,
+      label: 'planner-agent',
     })
 
-    const text = completion.choices[0]?.message?.content?.trim()
+    const text = completion.text?.trim()
     if (text) ctoBrief = text
   } catch {
     // LLM step is non-fatal — fall back to generated summary

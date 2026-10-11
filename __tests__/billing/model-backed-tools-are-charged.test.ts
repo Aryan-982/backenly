@@ -171,12 +171,12 @@ describe('token meter — behaviour', () => {
 describe('the billing contract is wired at every boundary', () => {
   const read = (p: string) => fs.readFileSync(path.join(ROOT, p), 'utf8')
 
-  it('both OpenAI clients attach the meter', () => {
-    // The platform has two clients that grew up separately. A model call added
-    // through either one must be countable, or "is this billed?" becomes a
-    // question about which module someone happened to import.
-    expect(read('lib/ai/openai-service.ts')).toContain('attachTokenMeter')
-    expect(read('lib/openai/client.ts')).toContain('attachTokenMeter')
+  it('has one model boundary left, the AI gateway', () => {
+    // There used to be two OpenAI clients that grew up separately, and a model
+    // call through either had to be countable. Both are gone: every call goes
+    // through lib/ai/llm, so "is this billed?" has one place to answer it.
+    expect(fs.existsSync(path.join(ROOT, 'lib/ai/openai-service.ts'))).toBe(false)
+    expect(fs.existsSync(path.join(ROOT, 'lib/openai/client.ts'))).toBe(false)
   })
 
   it('the AI gateway reports every call that ran into the meter', () => {

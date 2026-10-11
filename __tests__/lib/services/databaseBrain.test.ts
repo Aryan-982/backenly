@@ -55,20 +55,8 @@ jest.mock('@/lib/db/mongodb', () => ({
   }),
 }))
 
-// Mock OpenAI
-jest.mock('@/lib/openai/client', () => ({
-  openaiClient: {
-    chat: {
-      completions: {
-        create: jest.fn(),
-      },
-    },
-  },
-}))
-
 describe('Database Brain Service', () => {
   const mockPrisma = new PrismaClient() as any
-  const mockOpenAI = require('@/lib/openai/client').openaiClient
 
   beforeEach(() => {
     jest.clearAllMocks()

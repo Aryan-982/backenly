@@ -27,17 +27,20 @@
  */
 
 import { prisma } from '@/lib/db/prisma'
-import { getOpenAIClient, trackCompletionCost } from '@/lib/ai/openai-service'
+import { AiError, generate } from '@/lib/ai/llm'
 import { summariseFinding } from '@/lib/core/finding-summaries'
 
-/**
- * Strong-model pass for the few escalations; env-overridable. Defaults to the
- * same strong model as the fix author (agentic-fix-author) — escalations are
- * the rare cases where the deterministic loop gave up, so a weak diagnosis
- * wastes the one human review it gets (founder decision 2026-07-18).
- */
-function diagnosisModel(): string {
-  return process.env.AUTONOMY_DIAGNOSIS_MODEL || 'gpt-4o'
+/** The written diagnosis, as structured output: every field present, confidence one of three. */
+const DIAGNOSIS_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['rootCause', 'recommendation', 'riskNote', 'confidence'],
+  properties: {
+    rootCause: { type: 'string' },
+    recommendation: { type: 'string' },
+    riskNote: { type: 'string' },
+    confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+  },
 }
 
 const MAX_PER_TICK = 2
@@ -101,8 +104,6 @@ export async function diagnoseEscalatedFindings(projectId: string): Promise<numb
       }).catch(() => [] as Array<{ action: string; details: string | null; timestamp: Date }>),
     ])
 
-    const openai = getOpenAIClient()
-
     for (const finding of undiagnosed) {
       try {
         const details = (finding.details ?? {}) as Record<string, unknown>
@@ -161,30 +162,33 @@ export async function diagnoseEscalatedFindings(projectId: string): Promise<numb
             .join(' | ') || '(none)'}`,
         ].join('\n')
 
-        const completion = await openai.chat.completions.create({
-          model: diagnosisModel(),
-          temperature: 0.2,
-          max_tokens: 500,
-          response_format: { type: 'json_object' },
-          messages: [
-            {
-              role: 'system',
-              content:
-                'You are the senior backend engineer on call for an autonomous backend platform. ' +
-                'A health finding was escalated because the deterministic fix engine could not (or is not allowed to) repair it. ' +
-                'Write a diagnosis the project owner — often a non-engineer founder — and their coding agent can both act on. ' +
-                'Ground every claim in the evidence given; if the evidence is insufficient, say so in rootCause and lower the confidence. ' +
-                'NEVER invent tables, integrations, or errors not present in the evidence. ' +
-                'Respond with JSON: {"rootCause": string (2-3 plain sentences), "recommendation": string (the single best next action, concrete), "riskNote": string (what could go wrong if remediated wrongly, 1 sentence), "confidence": "high"|"medium"|"low"}.',
-            },
-            { role: 'user', content: prompt },
-          ],
-        })
-        trackCompletionCost(completion, projectId, 'autonomy-diagnosis')
-
-        const raw = completion.choices[0]?.message?.content ?? '{}'
+        // The deployment pays for this (autonomy.*), against its own monthly
+        // budget; with no provider or no budget left it fails before any call,
+        // and the deterministic investigation above has already run.
         let parsed: Partial<FindingDiagnosis>
-        try { parsed = JSON.parse(raw) } catch { continue }
+        let model: string
+        try {
+          const reply = await generate({
+            purpose: 'autonomy.diagnose',
+            system:
+              'You are the senior backend engineer on call for an autonomous backend platform. ' +
+              'A health finding was escalated because the deterministic fix engine could not (or is not allowed to) repair it. ' +
+              'Write a diagnosis the project owner — often a non-engineer founder — and their coding agent can both act on. ' +
+              'Ground every claim in the evidence given; if the evidence is insufficient, say so in rootCause and lower the confidence. ' +
+              'NEVER invent tables, integrations, or errors not present in the evidence. ' +
+              'rootCause: 2-3 plain sentences. recommendation: the single best next action, concrete. riskNote: what could go wrong if remediated wrongly, 1 sentence.',
+            messages: [{ role: 'user', content: prompt }],
+            jsonSchema: DIAGNOSIS_SCHEMA,
+            billing: { projectId },
+            label: 'autonomy-diagnosis',
+          })
+          parsed = reply.json as Partial<FindingDiagnosis>
+          model = reply.model
+        } catch (err) {
+          // Without a provider or budget, every later finding fails the same way.
+          if (err instanceof AiError && err.consumption === 'none' && !err.retryable) break
+          continue
+        }
         if (!parsed.rootCause || !parsed.recommendation) continue
 
         const diagnosis: FindingDiagnosis = {
@@ -192,7 +196,7 @@ export async function diagnoseEscalatedFindings(projectId: string): Promise<numb
           recommendation: String(parsed.recommendation).slice(0, 800),
           riskNote: String(parsed.riskNote ?? '').slice(0, 400),
           confidence: parsed.confidence === 'high' || parsed.confidence === 'low' ? parsed.confidence : 'medium',
-          model: completion.model,
+          model,
           at: new Date().toISOString(),
         }
 

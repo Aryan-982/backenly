@@ -12,10 +12,9 @@
  * plans and to fail fast on a misuse instead of timing out.
  */
 
-import { getOpenAIClient } from './openai-service'
+import { embed, EMBEDDING_DIMENSIONS, EMBEDDING_MODEL } from './llm/embeddings'
 
-export const EMBEDDING_MODEL = 'text-embedding-3-small'
-export const EMBEDDING_DIMENSIONS = 1536
+export { EMBEDDING_DIMENSIONS, EMBEDDING_MODEL }
 const MAX_BATCH = 96
 const MAX_INPUT_CHARS = 8000
 
@@ -47,15 +46,9 @@ export async function embedTexts(inputs: string[]): Promise<number[][]> {
     })
     if (nonEmpty.length === 0) continue
 
-    const openai = getOpenAIClient()
-    const resp = await openai.embeddings.create({
-      model: EMBEDDING_MODEL,
-      input: nonEmpty,
-    })
-
-    // OpenAI returns data[] in the same order as input[]
-    resp.data.forEach((row, k) => {
-      out[idxs[k]] = row.embedding
+    const vectors = await embed(nonEmpty)
+    vectors.forEach((vec, k) => {
+      out[idxs[k]] = vec
     })
   }
 

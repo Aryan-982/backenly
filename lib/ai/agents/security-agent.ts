@@ -2,10 +2,10 @@
 /** Security specialist agent: detects RLS gaps, auth gaps, and LLM-identified vulnerabilities in workspace schemas. */
 
 import { Pool } from 'pg'
-import OpenAI from 'openai'
 import { getWorkspaceDatabaseNames } from '@/lib/services/databaseProvisioning'
 import type { AgentInput, AgentResult, AgentFinding } from './types'
 
+import { chat } from '@/lib/ai/llm/chat'
 function makeId(): string {
   return `finding-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
@@ -118,26 +118,18 @@ export async function runSecurityAgent(input: AgentInput): Promise<AgentResult> 
     // ── 5. LLM deep-dive for injection risk, weak FK constraints, etc. ────
     if (liveTables.length > 0) {
       try {
-        const openai = new OpenAI({
-          apiKey: process.env.OPENAI_API_KEY,
-          timeout: 25_000,
-          maxRetries: 1,
-        })
-        const model = process.env.OPENAI_MODEL ?? 'gpt-4o-mini'
 
         const contextBlock = schemaContext
           ? `\nSchema DDL:\n${schemaContext}\n`
           : `\nTables: ${liveTables.join(', ')}\n`
 
-        const completion = await openai.chat.completions.create({
-          model,
-          max_tokens: 800,
-          temperature: 0.2,
+        const completion = await chat({
+          purpose: 'insight.explain',
           messages: [
             {
               role: 'system',
               content:
-                'You are a PostgreSQL security auditor for a Backend-as-a-Service platform. ' +
+                'You are a PostgreSQL security auditor for an autonomous backend platform. ' +
                 'Identify concrete security risks: SQL injection vectors, missing input validation, ' +
                 'weak FK constraints that allow orphan data, predictable ID patterns, or sensitive ' +
                 'columns stored in plaintext. Return a JSON array of findings, each with: ' +
@@ -149,9 +141,11 @@ export async function runSecurityAgent(input: AgentInput): Promise<AgentResult> 
               content: `Audit this workspace schema for security issues.${contextBlock}`,
             },
           ],
+          maxTokens: 800,
+          label: 'security-agent',
         })
 
-        const raw = completion.choices[0]?.message?.content?.trim() ?? '[]'
+        const raw = completion.text?.trim() ?? '[]'
         // Strip markdown fences if present
         const jsonText = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
         let llmFindings: Array<{
