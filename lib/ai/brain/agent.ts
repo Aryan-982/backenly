@@ -96,14 +96,14 @@ export interface BrainInput {
   /** Pre-confirmed destructive turn (e.g. the prior user message said "yes drop it"). */
   destructiveConfirmed?: boolean
   /**
-   * Per-turn idempotency key (UUID) used to prevent duplicate processing.
-   * the way down to `saveTurn`/`saveMessages` so the conversation log dedups
+   * Per-turn idempotency key (UUID) passed down to `saveTurn`/`saveMessages`
+   * so the conversation log dedups
    * cleanly across writers (route handler, brain terminal paths, retries).
    */
   requestId?: string | null
   /**
    * The product section the user is looking at while making a request.
-   * global — §7 page-aware context). E.g. "Database", "Auth & Users",
+   * E.g. "Database", "Auth & Users",
    * "Monitoring". Advisory only: lets "add an index to this table" or "why is
    * this failing" resolve without re-asking. Never required.
    */
