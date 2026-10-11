@@ -36,7 +36,7 @@ import { anthropicProvider, bedrockProvider } from './providers/anthropic'
 import { openaiProvider } from './providers/openai'
 import { defaultPayer, reserveSpend, settleSpend } from './spend'
 import type { GenerateRequest, GenerateResult, LlmProvider, NormalizedUsage, ProviderId, PurposeRoute } from './types'
-import { costOf, effectiveTokensOf, maxCostOf, normalizeUsage } from './usage'
+import { costOf, effectiveTokensOf, maxCostOf, maxEffectiveTokensOf, normalizeUsage } from './usage'
 
 export type { AiPurpose, GenerateRequest, GenerateResult, NormalizedUsage, ProviderId } from './types'
 export { AiError } from './errors'
@@ -163,6 +163,7 @@ export async function generate(req: GenerateRequest): Promise<GenerateResult> {
     model: route.model,
     payer: req.payer ?? defaultPayer(req.purpose),
     amountUsd: maxCostOf(route.model, params),
+    maxTokens: maxEffectiveTokensOf(route.model, params),
     expiresInMs: route.timeoutMs * MAX_ATTEMPTS + SETTLE_GRACE_MS,
     billingAccountId: req.billing?.billingAccountId,
     projectId: req.billing?.projectId,

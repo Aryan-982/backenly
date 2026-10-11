@@ -52,12 +52,19 @@ Every unknown booking is logged.
 
 ## Customer billing
 
-A deployment that bills customers registers a `CustomerSpendHook`:
+Customer-paid calls go through a `CustomerSpendHook`. The default is the credit hold in `lib/entitlements/credit-holds.ts`:
 
-- `reserve` holds credits for the worst case, and can refuse with `credits_exhausted`;
-- `settle` charges the real cost when inference ran, and nothing otherwise.
+- `reserve` holds the call's worst case, in effective tokens, on the account's monthly `account_ai_usage` row, in one conditional update. A call whose worst case does not fit in the credits left is refused with `credits_exhausted` before it is sent, and two calls racing for the last credits cannot both go out. A hold that cannot be written refuses the call with `spend_unavailable`.
+- `settle` releases the hold, whatever happened. It never charges.
 
-A self-hosted install registers none and bills nobody. The deployment's own limits apply either way.
+Charging stays where it was: `chargeAiCredits` after the turn, from the tokens the provider reported, and only for a turn that changed something. So nothing is billed twice, questions stay free, and a call whose answer was lost costs the customer nothing.
+
+Two limits of the design, stated rather than hidden:
+
+- Between a call settling and its turn being charged, its tokens are neither held nor charged, so a parallel turn can start in that gap. An overshoot is bounded by one turn's usage per concurrent turn.
+- A process that dies mid-call leaves its hold. Holds count as released once nothing has been held on the row for 15 minutes.
+
+Where there are no finite credits (a self-hosted install, an unlimited plan, or entitlements that cannot be read), nothing is held. The deployment's own limits apply either way. `setCustomerSpendHook(null)` turns holds off.
 
 ## Where to look
 

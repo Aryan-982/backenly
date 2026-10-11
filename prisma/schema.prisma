@@ -1383,16 +1383,21 @@ model UserAiUsage {
 // counters were kept in before organizations were billed on their own; nothing
 // writes it any more.
 model AccountAiUsage {
-  id                    String   @id @default(uuid())
+  id                    String    @id @default(uuid())
   billingAccountId      String
   date                  String // YYYY-MM
-  intentCount           Int      @default(0) // AI build actions this month (committed)
-  reservedCount         Int      @default(0) // AI build actions reserved but not yet committed
-  tokenCount            Int      @default(0)
-  apiRequestCount       BigInt   @default(0) // API requests this month
-  aiFunctionInvocations Int      @default(0) // AI Function invocations this month
-  createdAt             DateTime @default(now())
-  updatedAt             DateTime @updatedAt
+  intentCount           Int       @default(0) // AI build actions this month (committed)
+  reservedCount         Int       @default(0) // AI build actions reserved but not yet committed
+  tokenCount            Int       @default(0)
+  apiRequestCount       BigInt    @default(0) // API requests this month
+  aiFunctionInvocations Int       @default(0) // AI Function invocations this month
+  /// Worst-case tokens of model calls in flight, held before each is sent
+  /// (lib/entitlements/credit-holds.ts). Never charged; released on settle.
+  heldTokens            Int       @default(0)
+  /// When a hold last changed. Holds older than the TTL count as released.
+  heldAt                DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
 
   @@unique([billingAccountId, date])
   @@index([date])

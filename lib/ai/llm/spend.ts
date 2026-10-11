@@ -285,16 +285,20 @@ export function memorySpendLedger(): MemorySpendLedger {
  * call. Throw an AiError (kind `credits_exhausted`) from `reserve` to refuse.
  */
 export interface CustomerSpendHook {
-  reserve(input: { purpose: AiPurpose; model: string; maxUsd: number; billingAccountId?: string; projectId?: string }): Promise<{ id: string }>
+  /** `maxTokens` is the call's worst case in effective tokens, the unit AI credits count. */
+  reserve(input: { purpose: AiPurpose; model: string; maxUsd: number; maxTokens: number; billingAccountId?: string; projectId?: string }): Promise<{ id: string }>
   /** `chargeUsd` is 0 unless inference ran and returned usage. */
   settle(id: string, input: { chargeUsd: number; outcome: 'ran' | 'none' | 'unknown'; usage?: NormalizedUsage }): Promise<void>
 }
 
-let customerHook: CustomerSpendHook | null = null
+// Undefined until set: the credit hold (lib/entitlements/credit-holds.ts), a
+// no-op wherever there are no finite credits to protect. Null turns it off.
+let customerHook: CustomerSpendHook | null | undefined
 let ledger: SpendLedger = postgresSpendLedger
 let lastExpiry = 0
 
-export function setCustomerSpendHook(hook: CustomerSpendHook | null): void {
+/** Replace the customer hook. `null` turns customer holds off; `undefined` restores the credit hold. */
+export function setCustomerSpendHook(hook: CustomerSpendHook | null | undefined): void {
   customerHook = hook
 }
 
@@ -308,7 +312,15 @@ export interface Reservation {
   customerHoldId?: string
 }
 
-export async function reserveSpend(input: ReserveInput & { billingAccountId?: string; projectId?: string }, now = new Date()): Promise<Reservation> {
+async function currentCustomerHook(): Promise<CustomerSpendHook | null> {
+  if (customerHook === undefined) customerHook = (await import('@/lib/entitlements/credit-holds')).creditHoldHook
+  return customerHook
+}
+
+export async function reserveSpend(
+  input: ReserveInput & { maxTokens?: number; billingAccountId?: string; projectId?: string },
+  now = new Date(),
+): Promise<Reservation> {
   // Book abandoned reservations as unknown before checking the limit, at most
   // once a minute per process. They are what a crash mid-call leaves behind.
   if (now.getTime() - lastExpiry > 60_000) {
@@ -317,12 +329,15 @@ export async function reserveSpend(input: ReserveInput & { billingAccountId?: st
   }
 
   const hold = await ledger.reserve(input, spendLimits(), now)
-  if (input.payer !== 'customer' || !customerHook) return { hold }
+  if (input.payer !== 'customer') return { hold }
   try {
-    const { id } = await customerHook.reserve({
+    const hook = await currentCustomerHook()
+    if (!hook) return { hold }
+    const { id } = await hook.reserve({
       purpose: input.purpose,
       model: input.model,
       maxUsd: input.amountUsd,
+      maxTokens: input.maxTokens ?? 0,
       billingAccountId: input.billingAccountId,
       projectId: input.projectId,
     })
