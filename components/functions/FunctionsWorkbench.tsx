@@ -31,6 +31,7 @@ import {
   KitConfirmDialog, KitModal, KitTab, KitTabs, NoticeStrip, Spinner, StatusDot,
 } from '@/components/inspector/kit'
 import { FOCUS_INSET } from '@/components/console/tokens'
+import { useAgentConnection } from '@/lib/hooks/useAgentConnection'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -427,6 +428,9 @@ export function FunctionsWorkbench({ projectId }: { projectId: string }) {
   const [query, setQuery] = useState('')
   const [mobilePane, setMobilePane] = useState<'list' | 'detail'>('list')
   const [showNew, setShowNew] = useState(false)
+  // Functions come from the agent, so the empty state and New function point
+  // at it: Connect until it is connected, then just the asks to send it.
+  const agent = useAgentConnection(projectId)
 
   const [cleaningUp, setCleaningUp] = useState(false)
   const [runningAll, setRunningAll] = useState(false)
@@ -818,13 +822,15 @@ export function FunctionsWorkbench({ projectId }: { projectId: string }) {
                     functions.length === 0 ? (
                       <div className="flex w-full flex-col items-center gap-4">
                         <AgentPrompt prompt={EXAMPLE_PROMPTS[0]} />
-                        <Link
-                          href={`/app/projects/${projectId}/connect`}
-                          className="inline-flex h-[32px] items-center gap-1.5 rounded-[7px] border border-white/[0.10] bg-white/[0.04] px-3 text-[13px] font-medium text-zinc-100 transition-colors hover:bg-white/[0.08]"
-                        >
-                          <Cable className="h-3.5 w-3.5" />
-                          Connect your agent
-                        </Link>
+                        {agent.needsConnect && (
+                          <Link
+                            href={`/app/projects/${projectId}/connect`}
+                            className="inline-flex h-[32px] items-center gap-1.5 rounded-[7px] border border-white/[0.10] bg-white/[0.04] px-3 text-[13px] font-medium text-zinc-100 transition-colors hover:bg-white/[0.08]"
+                          >
+                            <Cable className="h-3.5 w-3.5" />
+                            Connect your agent
+                          </Link>
+                        )}
                       </div>
                     ) : undefined
                   }
@@ -983,14 +989,16 @@ export function FunctionsWorkbench({ projectId }: { projectId: string }) {
         width="max-w-lg"
         footer={
           <>
-            <KitButton variant="ghost" onClick={() => setShowNew(false)}>Close</KitButton>
-            <Link
-              href={`/app/projects/${projectId}/connect`}
-              className="inline-flex h-[32px] items-center gap-1.5 rounded-[7px] bg-white px-3 text-[13px] font-medium text-zinc-950 transition-colors hover:bg-zinc-200"
-            >
-              <Cable className="h-3.5 w-3.5" />
-              Connect your agent
-            </Link>
+            <KitButton variant={agent.needsConnect ? 'ghost' : 'secondary'} onClick={() => setShowNew(false)}>Close</KitButton>
+            {agent.needsConnect && (
+              <Link
+                href={`/app/projects/${projectId}/connect`}
+                className="inline-flex h-[32px] items-center gap-1.5 rounded-[7px] bg-white px-3 text-[13px] font-medium text-zinc-950 transition-colors hover:bg-zinc-200"
+              >
+                <Cable className="h-3.5 w-3.5" />
+                Connect your agent
+              </Link>
+            )}
           </>
         }
       >

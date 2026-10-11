@@ -33,6 +33,7 @@ import {
   type StatusTone,
 } from '@/components/inspector/kit'
 import { EDGE, FOCUS, PAGE_GUTTER, PAGE_WIDTH, RULE } from '@/components/console/tokens'
+import { useAgentConnection } from '@/lib/hooks/useAgentConnection'
 
 type ProjectStatus = 'PRIVATE' | 'DEPLOYING' | 'LIVE' | 'FAILED'
 
@@ -79,6 +80,8 @@ interface ReadinessCheck {
 export default function PublishPage() {
   const params = useParams()
   const projectId = params.id as string
+  // Nothing to publish is the agent's next job: offer Connect only until it is connected.
+  const agent = useAgentConnection(projectId)
 
   const [project, setProject] = useState<ProjectData | null>(null)
   const [publishedVersions, setPublishedVersions] = useState<PublishedVersion[]>([])
@@ -311,7 +314,9 @@ export default function PublishPage() {
     if (status === 'DEPLOYING') return 'Creating a stable production snapshot. The runtime stays locked until activation completes.'
     if (status === 'FAILED') return 'The last publish failed. Production is unchanged, and the previous version is still serving.'
     if (hasRealBackend) return 'Your backend is built. Publish it to get a stable, versioned endpoint your app can rely on.'
-    return 'Production changes only when you publish. Connect your coding agent to start building.'
+    return agent.connected
+      ? 'Production changes only when you publish. Ask your agent to start building.'
+      : 'Production changes only when you publish. Connect your coding agent to start building.'
   })()
 
   const publishButton = (label: string) => (
@@ -573,10 +578,12 @@ export default function PublishPage() {
               action={
                 <div className="flex w-full flex-col items-center gap-3">
                   <AgentPrompt prompt="Build the backend for a task tracker: projects, tasks with a status and a due date, and email sign-in. Only a task's owner can edit it." />
-                  <Link href={`/app/projects/${projectId}/connect`} className={`${BUTTON_BASE} ${BUTTON_SIZES.md} ${BUTTON_VARIANTS.primary}`}>
-                    <Cable className="h-[15px] w-[15px]" strokeWidth={2} />
-                    Connect your agent
-                  </Link>
+                  {agent.needsConnect && (
+                    <Link href={`/app/projects/${projectId}/connect`} className={`${BUTTON_BASE} ${BUTTON_SIZES.md} ${BUTTON_VARIANTS.primary}`}>
+                      <Cable className="h-[15px] w-[15px]" strokeWidth={2} />
+                      Connect your agent
+                    </Link>
+                  )}
                 </div>
               }
             />
@@ -648,12 +655,18 @@ export default function PublishPage() {
             <EmptyState
               icon={AlertCircle}
               title="Live, but empty"
-              description="This project is published, but there is nothing to serve yet. Connect your coding agent and build the backend first."
+              description={
+                agent.connected
+                  ? 'This project is published, but there is nothing to serve yet. Ask your agent to build the backend first.'
+                  : 'This project is published, but there is nothing to serve yet. Connect your coding agent and build the backend first.'
+              }
               action={
-                <Link href={`/app/projects/${projectId}/connect`} className={`${BUTTON_BASE} ${BUTTON_SIZES.md} ${BUTTON_VARIANTS.secondary}`}>
-                  <Cable className="h-[15px] w-[15px]" strokeWidth={2} />
-                  Connect your agent
-                </Link>
+                agent.needsConnect ? (
+                  <Link href={`/app/projects/${projectId}/connect`} className={`${BUTTON_BASE} ${BUTTON_SIZES.md} ${BUTTON_VARIANTS.secondary}`}>
+                    <Cable className="h-[15px] w-[15px]" strokeWidth={2} />
+                    Connect your agent
+                  </Link>
+                ) : undefined
               }
             />
           </KitCard>

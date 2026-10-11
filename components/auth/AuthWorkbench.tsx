@@ -27,6 +27,7 @@ import {
   AgentPrompt, CommandBar, CopyField, EmptyState, IconButton, INPUT_BASE, KIT, KitTab, KitTabs, Spinner, Tag,
 } from '@/components/inspector/kit'
 import { FOCUS_INSET } from '@/components/console/tokens'
+import { useAgentConnection } from '@/lib/hooks/useAgentConnection'
 
 interface EndUser {
   id: string
@@ -132,6 +133,7 @@ function UsersGrid({
   onRefresh: () => void
 }) {
   const router = useRouter()
+  const agent = useAgentConnection(projectId)
   const [query, setQuery] = useState('')
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
@@ -198,13 +200,15 @@ function UsersGrid({
                   !query ? (
                     <div className="flex w-full flex-col items-center gap-4">
                       <AgentPrompt prompt="Add email and password sign-up and sign-in to the app, with password reset." />
-                      <button
-                        type="button"
-                        onClick={() => router.push(`/app/projects/${projectId}/connect`)}
-                        className="text-[13px] font-medium text-zinc-300 underline decoration-white/20 underline-offset-4 transition-colors hover:text-zinc-50 hover:decoration-white/50"
-                      >
-                        Connect your agent
-                      </button>
+                      {agent.needsConnect && (
+                        <button
+                          type="button"
+                          onClick={() => router.push(`/app/projects/${projectId}/connect`)}
+                          className="text-[13px] font-medium text-zinc-300 underline decoration-white/20 underline-offset-4 transition-colors hover:text-zinc-50 hover:decoration-white/50"
+                        >
+                          Connect your agent
+                        </button>
+                      )}
                     </div>
                   ) : undefined
                 }

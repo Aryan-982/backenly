@@ -18,6 +18,7 @@ import { chatCompletionStream, isAIEnabled } from '@/lib/openai/client'
 import { assistantPrompt } from '@/lib/ai/brain/prompts'
 import { buildConnectManifest } from '@/lib/services/connect-manifest'
 import { resolvePublicBaseUrl } from '@/lib/services/public-url'
+import { agentConnectionFor } from '@/lib/mcp/agent-connection'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
@@ -49,9 +50,13 @@ function parseMessages(body: unknown): ClientMessage[] | null {
  * Compact per-project grounding: names + ready snippets, deliberately NOT the
  * full column/row detail — the assistant guides, it doesn't inspect data.
  */
-async function buildProjectContext(projectId: string, projectName: string, origin: string): Promise<string> {
+async function buildProjectContext(projectId: string, projectName: string, origin: string, userId: string): Promise<string> {
   try {
-    const manifest = await buildConnectManifest(projectId, origin)
+    const [manifest, agent] = await Promise.all([
+      buildConnectManifest(projectId, origin),
+      // Best effort: unknown reads as not connected, the line it replaced.
+      agentConnectionFor(projectId, userId).catch(() => null),
+    ])
     const tableNames = manifest.tables.map((t) => t.name)
     const authMethods = manifest.auth.enabled ? manifest.auth.methods.join(', ') : 'not enabled yet'
     return [
@@ -60,7 +65,11 @@ async function buildProjectContext(projectId: string, projectName: string, origi
       `- Tables (${tableNames.length}): ${tableNames.length ? tableNames.join(', ') : 'none yet'}`,
       `- End-user auth: ${authMethods} · Storage buckets: ${manifest.storage.buckets.length} · Realtime: ${manifest.realtime.enabled ? 'available' : 'available (no subscriptions yet)'}`,
       `- Frontend SDK: \`${manifest.sdk.importLine}\` then \`${manifest.sdk.initLine}\``,
-      `- Coding agent (MCP): the Connect section generates the exact per-agent setup (Claude Code, Cursor, any MCP host) with a scoped key.`,
+      // The client's name stays out: an OAuth client registers its own, and
+      // that is not text to put in a system prompt.
+      agent?.connected
+        ? `- Coding agent (MCP): CONNECTED for this user, last call ${agent.lastSeenAt?.toISOString() ?? 'unknown'}. To build or change something they ask that agent directly; do not walk them through connecting it again.`
+        : `- Coding agent (MCP): not connected for this user yet. The Connect section generates the exact per-agent setup (Claude Code, Cursor, any MCP host) with a scoped key.`,
     ].join('\n')
   } catch {
     // Grounding is best-effort — a manifest failure must not take down Q&A.
@@ -94,7 +103,7 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const projectContext = await buildProjectContext(projectId, project.name, resolvePublicBaseUrl(request))
+    const projectContext = await buildProjectContext(projectId, project.name, resolvePublicBaseUrl(request), userId)
 
     const encoder = new TextEncoder()
     const stream = new ReadableStream<Uint8Array>({
