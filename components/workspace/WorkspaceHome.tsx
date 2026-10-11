@@ -810,7 +810,7 @@ function ReceiptRow({ item }: { item: AutonomyLastAction }) {
  * snapshot, Apply/Verify a 30-day track record. Without that split "15 broken"
  * beside "100% proven fixed" reads as the loop contradicting itself.
  *
- * Each node also carries a one-sentence LOOP_EXPLAIN on hover and focus.
+ * Each node also carries a one-sentence LOOP_EXPLAIN for screen readers.
  *
  * Motion is telemetry, never theater: the lit node is the real derived phase,
  * the heal sweep fires only when a finding genuinely closed, OFF freezes the
@@ -1029,7 +1029,7 @@ function SelfHealingLoop({
                     type="button"
                     onClick={onReview}
                     title={`${stats.pending} change${stats.pending === 1 ? '' : 's'} waiting on your approval`}
-                    className="group/node relative flex flex-col items-center rounded-[10px] pb-1 outline-none focus:outline-none focus-visible:outline-none focus:ring-0 focus-visible:ring-0 select-none"
+                    className={`group/node relative flex flex-col items-center rounded-[10px] pb-1 select-none ${FOCUS}`}
                   >
                     {node}
                   </button>

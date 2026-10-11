@@ -202,9 +202,8 @@ function LoginForm() {
                   trailing={
                     <button
                       type="button"
-                      tabIndex={-1}
                       onClick={() => setShowPassword((s) => !s)}
-                      className="text-zinc-500 hover:text-zinc-300 transition-colors focus:outline-none"
+                      className="rounded-sm text-zinc-500 hover:text-zinc-300 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-300/60"
                       aria-label={showPassword ? 'Hide password' : 'Show password'}
                     >
                       <Icon icon={showPassword ? 'ri:eye-off-line' : 'ri:eye-line'} width={16} />
