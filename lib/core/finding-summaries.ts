@@ -1,7 +1,7 @@
 /**
  * FINDING SUMMARIES — the single human-language rendering of a HealthFinding.
  *
- * Both the dashboard AdvisorBlock (client) and /api/projects/:id/health
+ * Both the dashboard (client) and /api/projects/:id/health
  * (server) render finding rows for the user. They used to each carry their own
  * partial switch over finding types; anything either copy didn't know fell
  * through to the raw type string ("verification failed") — a HIGH-severity row

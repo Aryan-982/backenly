@@ -20,6 +20,8 @@ jest.mock('@/lib/db/prisma', () => ({
     healthFinding: { findMany: jest.fn(), findFirst: jest.fn() },
     correctionEvent: { count: jest.fn() },
     project: { findUnique: jest.fn() },
+    // The health route also reads the loop's last sensor record.
+    projectPreference: { findUnique: jest.fn().mockResolvedValue(null) },
   },
 }))
 
