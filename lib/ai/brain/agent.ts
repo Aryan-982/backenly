@@ -1631,12 +1631,12 @@ function buildIntentHint(intent: BrainIntent): string {
     case 'MODIFY':
       return 'Hint: this is a MODIFY request on an existing resource. Use add_column / generate_api / add_rls etc. Do NOT recreate the table.'
     case 'FIX':
-      return 'Hint: this is a FIX request. Use read_backend_state to identify what is broken, then fix_backend or a specific mutation. Never destructive without confirmation.'
+      return 'Hint: this is a FIX request. Use read_backend_state to identify what is broken, then fix_backend or a specific mutation. A destructive fix waits for a person\'s approval.'
     case 'DESTRUCTIVE':
       return [
         'Hint: this is a DESTRUCTIVE request. Identify the exact target and CALL the destructive tool now — do NOT ask for confirmation in prose.',
-        'An automatic safety gate intercepts unconfirmed destructive calls, shows the user a structured confirmation card (with live row counts), and persists the request so their next "confirm" executes it deterministically.',
-        'Prose-asking without calling the tool strands the user in a loop. If the user already confirmed this turn, the gate lets the call through.',
+        'The approval gate stops the call before it runs and queues it, exactly as issued, for the project owner to approve or reject in the dashboard, with the live row count.',
+        'No message approves it, including a "yes" or "confirm" in this turn or the next. Describing the operation without calling the tool queues nothing, so the owner has nothing to approve.',
       ].join(' ')
     case 'QUESTION':
       return 'Hint: this is a QUESTION about the project state. Call read_backend_state and then finish with the answer. Do NOT mutate anything.'

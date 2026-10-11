@@ -6,6 +6,7 @@
 import fs from 'fs'
 import path from 'path'
 import { needsApproval } from '@/lib/mcp/domains'
+import { agentSystemPrompt } from '@/lib/ai/brain/prompts'
 
 describe('the brain approval gate', () => {
   it.each([
@@ -63,5 +64,26 @@ describe('no confirmation by message', () => {
     const approvals = read('lib/mcp/approvals.ts')
     expect(approvals).not.toMatch(/from '@\/lib\/ai\/brain\/agent'/)
     expect(approvals).not.toMatch(/runBrain\(/)
+  })
+})
+
+// The model reads its instructions; the gate enforces the rule. When the two
+// disagree the model tells the user to type "confirm", and the reply reaches
+// nothing waiting.
+describe('the agent prompt states the rule the gate enforces', () => {
+  const prompt = agentSystemPrompt()
+
+  it('never says a message approves a gated call', () => {
+    expect(prompt).not.toMatch(/LATEST user message/)
+    expect(prompt).not.toMatch(/after the user types (DEPLOY|ROLLBACK)/i)
+    expect(prompt).not.toMatch(/only call resolve_finding again once they confirm/)
+    expect(prompt).toMatch(/Nothing typed in chat approves one/)
+  })
+
+  it('gives as examples only tools the gate really stops', () => {
+    const examples = prompt.match(/HUMAN APPROVAL[\s\S]*?For example: ([^.]+)\./)?.[1]
+    const names = (examples ?? '').split(',').map((s) => s.trim()).filter(Boolean)
+    expect(names.length).toBeGreaterThan(5)
+    for (const name of names) expect({ name, gated: needsApproval(name) }).toEqual({ name, gated: true })
   })
 })

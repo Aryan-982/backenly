@@ -937,7 +937,7 @@ export const BRAIN_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     'List open / pending health findings (issues the platform detected) for this project — id, type, severity, target table/column, reason. Use to map a problem (e.g. a pasted error screenshot or "fix this") to a concrete issue before resolve_finding. Side-effect free.',
     {}),
   fn('resolve_finding',
-    'Resolve a detected health finding through the governed fix engine. Pass findingId (from list_findings or the diagnostic context). If you only know the kind of problem, pass findingType and/or tableName/columnName and the closest match is resolved. Safe/additive fixes (FK, RLS, index, API) apply immediately and are verified; auth/destructive/irreversible fixes return a confirmation request — relay it to the user and only call again after they confirm.',
+    'Resolve a detected health finding through the governed fix engine. Pass findingId (from list_findings or the diagnostic context). If you only know the kind of problem, pass findingType and/or tableName/columnName and the closest match is resolved. Safe/additive fixes (FK, RLS, index, API) apply immediately and are verified. Auth/destructive/irreversible fixes are not applied here: the result says the fix needs a person\'s approval in the Review Queue (Autonomy page). Relay that, and do not call again for the same finding: no message can approve it.',
     {
       findingId: { type: 'string', description: 'Exact finding id (preferred — from list_findings or the diagnostic context).' },
       findingType: { type: 'string', description: 'e.g. missing_fk, missing_rls, integration_smtp_unreachable — used to match a finding when no id is known.' },
@@ -2862,8 +2862,8 @@ export async function dispatchTool(
         userId: ctx.userId,
       })
       // 'fixed' is success. needs_confirmation / notify / failed are surfaced as
-      // ok:false so the model relays the message (asks the user to confirm, or
-      // explains the manual step) rather than claiming it fixed something.
+      // ok:false so the model relays the message (where a person approves the
+      // fix, or the manual step) rather than claiming it fixed something.
       return finalize({
         ok: res.outcome === 'fixed',
         summary: clip(res.message),

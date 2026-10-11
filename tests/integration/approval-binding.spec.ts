@@ -11,6 +11,7 @@
 import crypto from 'crypto'
 import { prisma } from '@/lib/db/prisma'
 import { createApprovalRequest, decideApproval } from '@/lib/mcp/approvals'
+import { resolveFindingFromChat } from '@/lib/core/auto-fix-engine'
 
 let ownerId: string
 let projectId: string
@@ -112,5 +113,30 @@ describe('approval binding', () => {
     })
     const stored = await prisma.agentApprovalRequest.findUnique({ where: { id: row.id } })
     expect(stored).toMatchObject({ tool: 'drop_table', toolArgs: { tableName: 'drop_me' }, status: 'pending' })
+  }, 60_000)
+
+  it('puts a chat-requested fix that needs a person in the Review Queue, and runs nothing', async () => {
+    // Removing an endpoint may break clients, so this fix always needs a person.
+    const finding = await prisma.healthFinding.create({
+      data: { projectId, type: 'dead_api_endpoint', severity: 'warning', details: { path: '/api/old' } },
+    })
+
+    const res = await resolveFindingFromChat(finding.id, projectId, {})
+
+    expect(res.outcome).toBe('needs_confirmation')
+    expect(res.message).toMatch(/waiting in the Review Queue/)
+    expect(res.message).not.toMatch(/confirm and I'll apply/i)
+    // The queue lists pending_approval findings only; nothing was applied.
+    const after = await prisma.healthFinding.findUnique({ where: { id: finding.id } })
+    expect(after).toMatchObject({ status: 'pending_approval', autoFixed: false, fixAppliedAt: null })
+    const audit = await prisma.auditLog.findFirst({
+      where: { projectId, action: 'HEALTH_FIX_AWAITING_APPROVAL' },
+    })
+    expect(audit).not.toBeNull()
+
+    // Asking again changes nothing and still points to the queue.
+    const again = await resolveFindingFromChat(finding.id, projectId, {})
+    expect(again.message).toMatch(/waiting in the Review Queue/)
+    expect(await prisma.auditLog.count({ where: { projectId, action: 'HEALTH_FIX_AWAITING_APPROVAL' } })).toBe(1)
   }, 60_000)
 })
