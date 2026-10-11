@@ -8,42 +8,44 @@
  * bare type string, leaving the human (or their coding agent) to re-derive the
  * situation from scratch.
  *
- * This module is the server-side "senior engineer pass": for each escalated
- * finding it gathers the evidence (finding details, what autonomy already
- * tried, the project's table inventory) and asks a model to write a diagnosis:
- * root cause, recommended remediation, risk note. The diagnosis is stored on
+ * This module is the server-side "senior engineer pass". For each escalated
+ * finding it first runs the deterministic investigation, whose conclusive
+ * verdicts are written as fact. Only when that cannot conclude does the
+ * investigator (lib/autonomy/investigator.ts) take over: Claude, with
+ * read-only probes, writing a hypothesis that code then checks against what
+ * actually ran and what actually exists. The diagnosis is stored on
  * `details.diagnosis` and surfaces in the Review Queue, the dashboard, and the
- * get_pending_incidents agent briefing.
+ * get_pending_incidents agent briefing, labelled by where it came from.
  *
  * DELIBERATE SAFETY CONTRACT (mirrors the reconciler's shadow-first stance):
  *   • This module NEVER executes anything. It writes words, not mutations.
  *     The human (or their agent, through the governed door) decides.
- *   • Bounded cost: max N diagnoses per project per tick, only for findings
- *     without one, and re-diagnosis only when the finding's evidence changed.
+ *   • Bounded cost: max N per project per tick and a daily cap per project;
+ *     once per evidence fingerprint (re-investigated only when the evidence
+ *     changes); at most MAX_ATTEMPTS failed attempts, spaced 10m, 1h, 6h;
+ *     and the deployment's own monthly AI budget (autonomy.* is
+ *     platform-paid), which stops every call when it is used up.
  *   • Fail-silent per finding — a model error never breaks the autonomy tick.
  *
  * Runs on Backenly's servers 24/7 — the "laptop open at 3am" is not required;
  * intelligence is an API call, not a device.
  */
 
+import crypto from 'crypto'
 import { prisma } from '@/lib/db/prisma'
-import { AiError, generate } from '@/lib/ai/llm'
+import { AiError } from '@/lib/ai/llm'
 import { summariseFinding } from '@/lib/core/finding-summaries'
-
-/** The written diagnosis, as structured output: every field present, confidence one of three. */
-const DIAGNOSIS_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['rootCause', 'recommendation', 'riskNote', 'confidence'],
-  properties: {
-    rootCause: { type: 'string' },
-    recommendation: { type: 'string' },
-    riskNote: { type: 'string' },
-    confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
-  },
-}
+import { resolveWorkspaceSchema } from '@/lib/services/workspace-pool'
+import { investigateFinding, type CatalogTable, type Investigation } from './investigator'
 
 const MAX_PER_TICK = 2
+/** Model investigations per project per 24h. Deterministic ones are not counted. */
+const DAILY_CAP = 5
+const MAX_ATTEMPTS = 3
+/** Wait after the 1st, 2nd and 3rd failed attempt. */
+const BACKOFF_MS = [10 * 60_000, 60 * 60_000, 6 * 60 * 60_000]
+/** Wait while no model can be called at all (no provider, no budget). Not an attempt. */
+const UNAVAILABLE_WAIT_MS = 60 * 60_000
 
 /** Narrow an unknown detail field to a usable string, or undefined. */
 function pickString(v: unknown): string | undefined {
@@ -57,6 +59,75 @@ export interface FindingDiagnosis {
   confidence: 'high' | 'medium' | 'low'
   model: string
   at: string
+}
+
+/** This module's own bookkeeping on a finding. */
+interface InvestigationState {
+  fingerprint: string
+  attempts: number
+  nextAt?: string
+  lastError?: string
+  history?: Array<{ at: string; verdict: string; rootCause: string }>
+}
+
+/**
+ * The evidence a finding carries, as one hash: the detector's output without
+ * this module's own fields. A diagnosis is kept while it matches.
+ */
+export function evidenceFingerprint(type: string, details: Record<string, unknown>): string {
+  const evidence = { ...details }
+  delete evidence.diagnosis
+  delete evidence.investigation
+  const stable = JSON.stringify(evidence, Object.keys(evidence).sort())
+  return crypto.createHash('sha256').update(`${type}\n${stable}`).digest('hex').slice(0, 32)
+}
+
+/** Whether a finding should be investigated on this tick. */
+export function isDue(details: Record<string, unknown>, fingerprint: string, now = Date.now()): boolean {
+  const diagnosis = details.diagnosis as { fingerprint?: string } | undefined
+  // A diagnosis from before fingerprints counts as current.
+  if (diagnosis && (diagnosis.fingerprint ?? fingerprint) === fingerprint) return false
+  const state = details.investigation as InvestigationState | undefined
+  if (!state || state.fingerprint !== fingerprint) return true
+  if (state.attempts >= MAX_ATTEMPTS) return false
+  return !state.nextAt || Date.parse(state.nextAt) <= now
+}
+
+/** Table and column names of the project's workspace schema. Names only, never rows. */
+async function loadCatalog(projectId: string): Promise<CatalogTable[]> {
+  const schema = await resolveWorkspaceSchema(projectId)
+  const rows = await prisma.$queryRawUnsafe<Array<{ table_name: string; column_name: string }>>(
+    `SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = $1 ORDER BY table_name, ordinal_position`,
+    schema,
+  )
+  const byTable = new Map<string, string[]>()
+  for (const r of rows) {
+    if (!byTable.has(r.table_name)) byTable.set(r.table_name, [])
+    byTable.get(r.table_name)!.push(r.column_name)
+  }
+  return [...byTable].slice(0, 80).map(([name, columns]) => ({ name, columns }))
+}
+
+/** The diagnosis stored for a model investigation: a hypothesis, labelled as one. */
+function hypothesisDiagnosis(investigation: Investigation, fingerprint: string, at: string) {
+  return {
+    rootCause: investigation.rootCause.slice(0, 800),
+    recommendation: investigation.recommendation.slice(0, 800),
+    riskNote: investigation.riskNote.slice(0, 400),
+    // At most medium, and low when it could not be tied to evidence or failed
+    // the checks.
+    confidence: investigation.verdict === 'explained' ? 'medium' : 'low',
+    model: investigation.model,
+    provenance: 'ai_hypothesis',
+    verdict: investigation.verdict,
+    evidenceRefs: investigation.evidenceRefs,
+    ruledOut: investigation.ruledOut,
+    evidence: investigation.evidence,
+    proposedAction: investigation.proposedAction,
+    validation: investigation.validation,
+    fingerprint,
+    at,
+  }
 }
 
 /**
@@ -78,20 +149,17 @@ export async function diagnoseEscalatedFindings(projectId: string): Promise<numb
       orderBy: { detectedAt: 'desc' },
       take: 10,
     })
-    const undiagnosed = candidates.filter((f) => {
-      const d = (f.details ?? {}) as Record<string, unknown>
-      return !d.diagnosis
-    }).slice(0, MAX_PER_TICK)
-    if (undiagnosed.length === 0) return 0
+    const due = candidates
+      .map((f) => {
+        const details = (f.details ?? {}) as Record<string, unknown>
+        return { finding: f, details, fingerprint: evidenceFingerprint(f.type, details) }
+      })
+      .filter((c) => isDue(c.details, c.fingerprint))
+      .slice(0, MAX_PER_TICK)
+    if (due.length === 0) return 0
 
-    // Shared cheap context: what the backend looks like + what autonomy did
-    // recently. One query each, reused across the findings in this tick.
-    const [tables, recentAutonomy] = await Promise.all([
-      prisma.table.findMany({
-        where: { projectId },
-        select: { name: true },
-        take: 60,
-      }).catch(() => [] as Array<{ name: string }>),
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000)
+    const [recentAutonomy, investigatedToday] = await Promise.all([
       prisma.auditLog.findMany({
         where: {
           projectId,
@@ -102,12 +170,17 @@ export async function diagnoseEscalatedFindings(projectId: string): Promise<numb
         take: 15,
         select: { action: true, details: true, timestamp: true },
       }).catch(() => [] as Array<{ action: string; details: string | null; timestamp: Date }>),
+      // Unreadable counts as spent: the cap fails closed.
+      prisma.auditLog.count({
+        where: { projectId, action: 'AUTONOMY_INVESTIGATION', timestamp: { gte: since } },
+      }).catch(() => DAILY_CAP),
     ])
+    let modelBudget = Math.max(0, DAILY_CAP - investigatedToday)
+    let catalog: CatalogTable[] | null = null
+    let modelUnavailable = false
 
-    for (const finding of undiagnosed) {
+    for (const { finding, details, fingerprint } of due) {
       try {
-        const details = (finding.details ?? {}) as Record<string, unknown>
-
         // ── Tier A½ — deterministic investigation, before the model ──────────
         // Where a symptom has several possible causes, real observations beat a
         // written argument: this pass eliminates explanations that predicted
@@ -117,15 +190,11 @@ export async function diagnoseEscalatedFindings(projectId: string): Promise<numb
         // will always produce one, because that is what it is for.
         //
         // Only its CONCLUSIVE verdicts short-circuit the model. An inconclusive
-        // investigation still narrowed the field, but a narrowed field is not a
-        // diagnosis, and presenting it as one would trade a confident wrong
-        // answer for a hesitant wrong answer.
-        const { diagnoseFinding, renderDiagnosis } = await import('./hypothesis')
-        const investigated = await diagnoseFinding(
-          projectId,
-          finding.type,
-          { table: pickString(details.tableName) ?? pickString(details.table) },
-        ).catch(() => null)
+        // investigation still narrowed the field, and the investigator starts
+        // from what it ruled out.
+        const { diagnoseFinding, renderDiagnosis, PROBE_REGISTRY } = await import('./hypothesis')
+        const table = pickString(details.tableName) ?? pickString(details.table)
+        const investigated = await diagnoseFinding(projectId, finding.type, { table }).catch(() => null)
 
         if (investigated && investigated.report.verdict.kind === 'conclusive') {
           const rendered = renderDiagnosis(investigated.report)
@@ -141,7 +210,9 @@ export async function diagnoseEscalatedFindings(projectId: string): Promise<numb
                     // from evidence, not from a model, and a reader should be
                     // able to tell which without asking.
                     model: 'deterministic-investigation',
+                    provenance: 'investigation',
                     evidence: investigated.report.trail,
+                    fingerprint,
                     at: new Date().toISOString(),
                   },
                 },
@@ -152,75 +223,97 @@ export async function diagnoseEscalatedFindings(projectId: string): Promise<numb
           }
         }
 
-        const prompt = [
-          `Finding type: ${finding.type} (severity ${finding.severity}, status ${finding.status}, detected ${finding.detectedAt.toISOString()})`,
-          `One-line summary: ${summariseFinding(finding.type, details)}`,
-          `Evidence (detector output): ${JSON.stringify(details).slice(0, 3000)}`,
-          `Project tables: ${tables.map(t => t.name).join(', ') || '(none)'}`,
-          `Recent autonomous activity (newest first): ${recentAutonomy
-            .map(a => `${a.timestamp.toISOString()} ${a.action} ${String(a.details ?? '').slice(0, 140)}`)
-            .join(' | ') || '(none)'}`,
-        ].join('\n')
+        if (modelUnavailable || modelBudget <= 0) continue
+        modelBudget--
+        if (!catalog) catalog = await loadCatalog(projectId).catch(() => [])
 
-        // The deployment pays for this (autonomy.*), against its own monthly
-        // budget; with no provider or no budget left it fails before any call,
-        // and the deterministic investigation above has already run.
-        let parsed: Partial<FindingDiagnosis>
-        let model: string
+        const state = details.investigation as InvestigationState | undefined
+        const prior = state?.fingerprint === fingerprint ? state : undefined
+        let investigation: Investigation
         try {
-          const reply = await generate({
-            purpose: 'autonomy.diagnose',
-            system:
-              'You are the senior backend engineer on call for an autonomous backend platform. ' +
-              'A health finding was escalated because the deterministic fix engine could not (or is not allowed to) repair it. ' +
-              'Write a diagnosis the project owner — often a non-engineer founder — and their coding agent can both act on. ' +
-              'Ground every claim in the evidence given; if the evidence is insufficient, say so in rootCause and lower the confidence. ' +
-              'NEVER invent tables, integrations, or errors not present in the evidence. ' +
-              'rootCause: 2-3 plain sentences. recommendation: the single best next action, concrete. riskNote: what could go wrong if remediated wrongly, 1 sentence.',
-            messages: [{ role: 'user', content: prompt }],
-            jsonSchema: DIAGNOSIS_SCHEMA,
-            billing: { projectId },
-            label: 'autonomy-diagnosis',
-          })
-          parsed = reply.json as Partial<FindingDiagnosis>
-          model = reply.model
+          investigation = await investigateFinding(
+            {
+              projectId,
+              finding: {
+                type: finding.type,
+                severity: finding.severity,
+                status: finding.status,
+                detectedAt: finding.detectedAt,
+                summary: summariseFinding(finding.type, details),
+                details,
+              },
+              deterministic: investigated?.report ?? null,
+              catalog,
+              recentActivity: recentAutonomy.map(
+                (a) => `${a.timestamp.toISOString()} ${a.action} ${String(a.details ?? '').slice(0, 140)}`,
+              ),
+              priorAttempts: prior?.history ?? [],
+            },
+            (probe, probeTable) => PROBE_REGISTRY[probe]({ projectId, table: probeTable ?? table }),
+            Object.keys(PROBE_REGISTRY),
+          )
         } catch (err) {
-          // Without a provider or budget, every later finding fails the same way.
-          if (err instanceof AiError && err.consumption === 'none' && !err.retryable) break
+          const ai = err instanceof AiError ? err : null
+          // No provider, or no budget: nothing ran and nothing will this tick.
+          // Not counted as an attempt, so the finding is investigated once AI
+          // is available again.
+          const unavailable = ai !== null && ai.consumption === 'none' && !ai.retryable
+          if (unavailable) modelUnavailable = true
+          const attempts = (prior?.attempts ?? 0) + (unavailable ? 0 : 1)
+          const wait = unavailable ? UNAVAILABLE_WAIT_MS : BACKOFF_MS[Math.min(attempts - 1, BACKOFF_MS.length - 1)]
+          const next: InvestigationState = {
+            fingerprint,
+            attempts,
+            nextAt: new Date(Date.now() + wait).toISOString(),
+            lastError: ai?.kind ?? 'error',
+            history: prior?.history ?? [],
+          }
+          await prisma.healthFinding.update({
+            where: { id: finding.id },
+            data: { details: { ...details, investigation: next } as any },
+          }).catch(() => {})
           continue
         }
-        if (!parsed.rootCause || !parsed.recommendation) continue
 
-        const diagnosis: FindingDiagnosis = {
-          rootCause: String(parsed.rootCause).slice(0, 800),
-          recommendation: String(parsed.recommendation).slice(0, 800),
-          riskNote: String(parsed.riskNote ?? '').slice(0, 400),
-          confidence: parsed.confidence === 'high' || parsed.confidence === 'low' ? parsed.confidence : 'medium',
-          model,
-          at: new Date().toISOString(),
+        const at = new Date().toISOString()
+        const done: InvestigationState = {
+          fingerprint,
+          attempts: (prior?.attempts ?? 0) + 1,
+          history: [
+            ...(prior?.history ?? []),
+            { at, verdict: investigation.verdict, rootCause: investigation.rootCause.slice(0, 200) },
+          ].slice(-3),
         }
-
         await prisma.healthFinding.update({
           where: { id: finding.id },
-          data: { details: { ...details, diagnosis } as any },
+          data: {
+            details: {
+              ...details,
+              diagnosis: hypothesisDiagnosis(investigation, fingerprint, at),
+              investigation: done,
+            } as any,
+          },
         })
         await prisma.auditLog.create({
           data: {
             projectId,
-            action: 'AUTONOMY_DIAGNOSIS_WRITTEN',
+            action: 'AUTONOMY_INVESTIGATION',
             type: 'autonomy',
             details: JSON.stringify({
               findingId: finding.id,
               findingType: finding.type,
-              confidence: diagnosis.confidence,
-              model: diagnosis.model,
+              verdict: investigation.verdict,
+              valid: investigation.validation.ok,
+              problems: investigation.validation.problems,
+              toolCalls: investigation.evidence.length,
+              model: investigation.model,
             }),
             timestamp: new Date(),
           },
         }).catch(() => {})
         written++
       } catch {
-        // Per-finding isolation — one model failure never blocks the rest.
+        // Per-finding isolation — one failure never blocks the rest.
       }
     }
   } catch {

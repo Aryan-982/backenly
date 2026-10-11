@@ -590,6 +590,12 @@ tests/integration/brain-on-gateway.spec.ts
 # its usage row, so it needs a real Postgres.
 tests/integration/runtime-generate.spec.ts
 
+# Escalated findings: the deterministic investigation first, then the model
+# investigator with real read-only probes, a checked hypothesis stored as one,
+# once per evidence, with backoff after failures. The probes read the
+# project's catalog, so it needs a real Postgres.
+tests/integration/escalation-investigation.spec.ts
+
 # Every meter measures what lib/usage/axes.ts says: streamed egress bytes once and
 # never for internal traffic, MAU once per user per month, database size including
 # branch schemas, file size from metadata, and function runs that executed.
