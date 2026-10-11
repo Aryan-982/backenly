@@ -21,7 +21,8 @@
 
 import { AiError, generate, type AiErrorKind, type AiPurpose } from './llm'
 import { createTokenScope, runInTokenScope } from './token-meter'
-import { chargeAiCredits, enforceAiCredits } from '@/lib/entitlements/policy'
+import { enforceAiCredits } from '@/lib/entitlements/policy'
+import { closeCreditTurn } from '@/lib/entitlements/credit-holds'
 import { creditAccountOf } from '@/lib/usage/account'
 
 export type ModelAlias = 'default' | 'fast'
@@ -121,7 +122,8 @@ export async function generateForProject(input: {
     throw err
   } finally {
     // Charged from what the provider reported, after the call; nothing when
-    // it never ran.
-    if (account && meter.tokens > 0) chargeAiCredits(account, meter.tokens).catch(() => {})
+    // it never ran. Closing the turn also stops its credit hold counting, and
+    // only after the charge is recorded.
+    closeCreditTurn(account, meter, meter.tokens).catch(() => {})
   }
 }

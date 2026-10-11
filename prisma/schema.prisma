@@ -1383,25 +1383,45 @@ model UserAiUsage {
 // counters were kept in before organizations were billed on their own; nothing
 // writes it any more.
 model AccountAiUsage {
-  id                    String    @id @default(uuid())
+  id                    String   @id @default(uuid())
   billingAccountId      String
   date                  String // YYYY-MM
-  intentCount           Int       @default(0) // AI build actions this month (committed)
-  reservedCount         Int       @default(0) // AI build actions reserved but not yet committed
-  tokenCount            Int       @default(0)
-  apiRequestCount       BigInt    @default(0) // API requests this month
-  aiFunctionInvocations Int       @default(0) // AI Function invocations this month
-  /// Worst-case tokens of model calls in flight, held before each is sent
-  /// (lib/entitlements/credit-holds.ts). Never charged; released on settle.
-  heldTokens            Int       @default(0)
-  /// When a hold last changed. Holds older than the TTL count as released.
-  heldAt                DateTime?
-  createdAt             DateTime  @default(now())
-  updatedAt             DateTime  @updatedAt
+  intentCount           Int      @default(0) // AI build actions this month (committed)
+  reservedCount         Int      @default(0) // AI build actions reserved but not yet committed
+  tokenCount            Int      @default(0)
+  apiRequestCount       BigInt   @default(0) // API requests this month
+  aiFunctionInvocations Int      @default(0) // AI Function invocations this month
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
 
   @@unique([billingAccountId, date])
   @@index([date])
   @@map("account_ai_usage")
+}
+
+/// One customer-paid model call's hold on its account's AI credits
+/// (lib/entitlements/credit-holds.ts): reserved before it is sent, used at what
+/// it consumed until its turn is charged, then charged or released. Counts
+/// against the cap only while reserved or used and unexpired.
+model AiCreditHold {
+  id               String    @id @default(uuid())
+  billingAccountId String
+  /// YYYY-MM, matching account_ai_usage.date.
+  month            String
+  /// Worst case, in effective tokens.
+  tokens           Int
+  /// What the call actually used, once it ran.
+  usedTokens       Int?
+  /// reserved | used | charged | released
+  status           String    @default("reserved")
+  /// Taken inside a turn that will be charged; a call outside one is released when it settles.
+  turnScoped       Boolean   @default(false)
+  createdAt        DateTime  @default(now())
+  expiresAt        DateTime
+  settledAt        DateTime?
+
+  @@index([billingAccountId, month, status])
+  @@map("ai_credit_holds")
 }
 
 // A billing account's two credit balances, bonus and purchased, and the last

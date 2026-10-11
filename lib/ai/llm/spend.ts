@@ -34,6 +34,7 @@
 
 import { prisma } from '@/lib/db/prisma'
 import { AiError } from './errors'
+import { effectiveTokensOf } from './usage'
 import type { AiPurpose, NormalizedUsage } from './types'
 
 export type Payer = 'customer' | 'platform'
@@ -285,10 +286,14 @@ export function memorySpendLedger(): MemorySpendLedger {
  * call. Throw an AiError (kind `credits_exhausted`) from `reserve` to refuse.
  */
 export interface CustomerSpendHook {
-  /** `maxTokens` is the call's worst case in effective tokens, the unit AI credits count. */
-  reserve(input: { purpose: AiPurpose; model: string; maxUsd: number; maxTokens: number; billingAccountId?: string; projectId?: string }): Promise<{ id: string }>
-  /** `chargeUsd` is 0 unless inference ran and returned usage. */
-  settle(id: string, input: { chargeUsd: number; outcome: 'ran' | 'none' | 'unknown'; usage?: NormalizedUsage }): Promise<void>
+  /**
+   * `maxTokens` is the call's worst case in effective tokens, the unit AI
+   * credits count; `expiresInMs` is when the gateway books an unsettled call
+   * as unknown.
+   */
+  reserve(input: { purpose: AiPurpose; model: string; maxUsd: number; maxTokens: number; expiresInMs: number; billingAccountId?: string; projectId?: string }): Promise<{ id: string }>
+  /** `chargeUsd` and `tokens` (effective) are 0 unless inference ran and returned usage. */
+  settle(id: string, input: { chargeUsd: number; tokens: number; outcome: 'ran' | 'none' | 'unknown'; usage?: NormalizedUsage }): Promise<void>
 }
 
 // Undefined until set: the credit hold (lib/entitlements/credit-holds.ts), a
@@ -309,6 +314,7 @@ export function setSpendLedgerForTests(next: SpendLedger | null): void {
 
 export interface Reservation {
   hold: Hold
+  model: string
   customerHoldId?: string
 }
 
@@ -329,19 +335,20 @@ export async function reserveSpend(
   }
 
   const hold = await ledger.reserve(input, spendLimits(), now)
-  if (input.payer !== 'customer') return { hold }
+  if (input.payer !== 'customer') return { hold, model: input.model }
   try {
     const hook = await currentCustomerHook()
-    if (!hook) return { hold }
+    if (!hook) return { hold, model: input.model }
     const { id } = await hook.reserve({
       purpose: input.purpose,
       model: input.model,
       maxUsd: input.amountUsd,
       maxTokens: input.maxTokens ?? 0,
+      expiresInMs: input.expiresInMs,
       billingAccountId: input.billingAccountId,
       projectId: input.projectId,
     })
-    return { hold, customerHoldId: id }
+    return { hold, model: input.model, customerHoldId: id }
   } catch (err) {
     await ledger.settle(hold, 'released', 0).catch(() => {})
     throw err instanceof AiError
@@ -373,6 +380,7 @@ export async function settleSpend(
     await customerHook
       .settle(r.customerHoldId, {
         chargeUsd: charged,
+        tokens: outcome.consumption === 'ran' ? effectiveTokensOf(r.model, outcome.usage) : 0,
         outcome: outcome.consumption,
         ...(outcome.consumption === 'ran' ? { usage: outcome.usage } : {}),
       })

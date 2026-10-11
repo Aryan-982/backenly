@@ -1,50 +1,62 @@
 /**
  * AI CREDIT HOLDS
  * ===============
- * Before a customer-paid model call is sent, its worst case is held against the
- * account's AI credits in one conditional update on the account's monthly usage
- * row. Parallel turns used to each pass the read-only gate (enforceAiCredits)
- * and overshoot together; now a call whose worst case does not fit is refused
- * before it is sent.
+ * Every customer-paid model call holds its worst case against the account's AI
+ * credits before it is sent. Each hold is its own row (ai_credit_holds) with
+ * its own expiry, so one leaked hold never lives on because the account stays
+ * busy, and holds can be counted, settled and closed one by one.
  *
- * Holding is policy, not commercial recording, so it is public (see
- * lib/entitlements/provider.ts for that split). Charging is unchanged:
- * chargeAiCredits after the turn, from the tokens the provider reported, and
- * only for a turn that changed something. A hold is released when its call
- * settles, whatever happened, so a hold never charges and nothing is billed
- * twice. A call whose answer was lost reports no tokens, so the customer pays
- * nothing for it; the gateway's own ledger books it against the platform.
+ * The life of a hold:
  *
- * Known window: between a call settling and its turn being charged, its tokens
- * are neither held nor charged, so a parallel turn can start in that gap. That
- * bounds an overshoot by one turn's usage per concurrent turn, where it was
- * unbounded before.
+ *   reserved  taken before the call, under a per-account lock, only when the
+ *             credits already charged plus every live hold plus this call's
+ *             worst case fit the cap. Otherwise the call is refused unsent.
+ *   used      the call ran: the hold shrinks to the tokens it actually used and
+ *             KEEPS COUNTING until its turn is charged. This is what closes the
+ *             gap where a finished call was neither held nor charged.
+ *   charged   the turn was charged (closeCreditTurn): the usage now lives in
+ *             the charged total, so the hold stops counting.
+ *   released  the call never ran or its answer was lost (the customer pays
+ *             nothing for either), the turn was not charged, or nothing will
+ *             ever charge it (a call made outside any turn).
  *
- * A process that dies mid-call never releases its hold. Holds are treated as
- * released once nothing has been held on the row for HOLD_TTL_MINUTES, so a
- * crash costs an account at most that long of reduced headroom.
+ * Charge first, then close: closeCreditTurn records the charge and only then
+ * marks the turn's holds charged. In between, usage is counted twice, which is
+ * the safe direction; it is never counted zero times. If the charge fails, the
+ * holds stay counted until they expire, so a billing fault can cost revenue but
+ * never let an account overspend. The charge itself is Cloud's commercial
+ * write (recordAiConsumption), which is why the two are ordered rather than
+ * one transaction.
+ *
+ * Settling only moves a hold out of `reserved`, so a late settlement after its
+ * turn closed changes nothing. Holds past their expiry count as nothing: a
+ * reserved hold expires with the gateway's own reservation, a used one
+ * USED_HOLD_TTL_MINUTES after its call, which bounds what a crash can strand.
  *
  * Fail-open where it always was: no account, no entitlements, unlimited credits
  * or a failed entitlement read mean no hold. A hold that cannot be WRITTEN
  * refuses the call, because sending it then would spend credits nobody checked.
+ *
+ * Holding is policy, not commercial recording, so it is public (see
+ * lib/entitlements/provider.ts for that split).
  */
 
 import { prisma } from '@/lib/db/prisma'
 import { AiError } from '@/lib/ai/llm/errors'
 import type { CustomerSpendHook } from '@/lib/ai/llm/spend'
+import { activeTokenScope, type TokenScope } from '@/lib/ai/token-meter'
 import { creditAccountOf } from '@/lib/usage/account'
-import { aiCreditCap, creditsFromTokens, thisMonth, TOKENS_PER_CREDIT } from './policy'
+import { aiCreditCap, chargeAiCredits, creditsFromTokens, thisMonth } from './policy'
 import { invalidateUsageCache } from './usage-cache'
 
-export const HOLD_TTL_MINUTES = 15
+/** How long a used hold keeps counting while its turn finishes and is charged. */
+export const USED_HOLD_TTL_MINUTES = 15
 
 /** A call nobody needs to hold credits for. */
 const NO_HOLD = { id: 'none' }
 
-const HOLD_ID = /^hold:(.+):(\d{4}-\d{2}):(\d+)$/
-
 export const creditHoldHook: CustomerSpendHook = {
-  async reserve({ maxTokens, billingAccountId, projectId }) {
+  async reserve({ maxTokens, expiresInMs, billingAccountId, projectId }) {
     const account = billingAccountId ?? (projectId ? await creditAccountOf(projectId) : null)
     if (!account) return NO_HOLD
     const cap = await aiCreditCap(account).catch(() => null)
@@ -52,26 +64,37 @@ export const creditHoldHook: CustomerSpendHook = {
 
     const month = thisMonth()
     const tokens = Math.max(0, Math.ceil(maxTokens))
-    let held: number
+    const scope = activeTokenScope()
+    let id: string | null
     try {
-      await prisma.accountAiUsage.upsert({
-        where: { billingAccountId_date: { billingAccountId: account, date: month } },
-        update: {},
-        create: { billingAccountId: account, date: month },
+      id = await prisma.$transaction(async (tx) => {
+        // Serialises holds for one account and month, so two calls racing for
+        // the last credits cannot both read the total without the other.
+        // Prisma stores DateTime as a UTC timestamp without a zone, so expiry
+        // is compared with UTC now; a bare now() would read it in the
+        // session's zone and, east of UTC, see live holds as expired.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`ai-credit-hold:${account}:${month}`}, 0))`
+        const [row] = await tx.$queryRaw<Array<{ charged: bigint; held: bigint }>>`
+          SELECT
+            COALESCE((SELECT "tokenCount" FROM "account_ai_usage"
+                       WHERE "billingAccountId" = ${account} AND "date" = ${month}), 0)::bigint AS charged,
+            COALESCE((SELECT SUM(CASE WHEN "status" = 'reserved' THEN "tokens" ELSE COALESCE("usedTokens", "tokens") END)
+                        FROM "ai_credit_holds"
+                       WHERE "billingAccountId" = ${account} AND "month" = ${month}
+                         AND "status" IN ('reserved', 'used') AND "expiresAt" > (now() AT TIME ZONE 'UTC')), 0)::bigint AS held`
+        if (creditsFromTokens(Number(row.charged) + Number(row.held) + tokens) > cap) return null
+        const hold = await tx.aiCreditHold.create({
+          data: {
+            billingAccountId: account,
+            month,
+            tokens,
+            turnScoped: scope !== undefined,
+            expiresAt: new Date(Date.now() + Math.max(expiresInMs, 60_000)),
+          },
+          select: { id: true },
+        })
+        return hold.id
       })
-      // One statement, so two calls racing for the last credits cannot both
-      // fit. A stale hold counts as zero, in the check and in what is kept.
-      held = await prisma.$executeRaw`
-        UPDATE "account_ai_usage"
-           SET "heldTokens" = (CASE WHEN "heldAt" IS NULL OR "heldAt" < now() - make_interval(mins => ${HOLD_TTL_MINUTES}::int)
-                                    THEN 0 ELSE "heldTokens" END) + ${tokens},
-               "heldAt" = now()
-         WHERE "billingAccountId" = ${account}
-           AND "date" = ${month}
-           AND ceil(("tokenCount"
-                     + (CASE WHEN "heldAt" IS NULL OR "heldAt" < now() - make_interval(mins => ${HOLD_TTL_MINUTES}::int)
-                             THEN 0 ELSE "heldTokens" END)
-                     + ${tokens})::numeric / ${TOKENS_PER_CREDIT}) <= ${cap}`
     } catch (err) {
       throw new AiError(
         'spend_unavailable',
@@ -79,7 +102,7 @@ export const creditHoldHook: CustomerSpendHook = {
         { consumption: 'none' },
       )
     }
-    if (held === 0) {
+    if (id === null) {
       throw new AiError(
         'credits_exhausted',
         `This call could use up to ${creditsFromTokens(tokens).toLocaleString()} AI credits, more than this account has ` +
@@ -87,18 +110,56 @@ export const creditHoldHook: CustomerSpendHook = {
         { consumption: 'none' },
       )
     }
+    scope?.holds.push(id)
     invalidateUsageCache(account)
-    return { id: `hold:${account}:${month}:${tokens}` }
+    return { id }
   },
 
-  async settle(id) {
-    const m = HOLD_ID.exec(id)
-    if (!m) return
-    const [, account, month, tokens] = m
-    await prisma.$executeRaw`
-      UPDATE "account_ai_usage"
-         SET "heldTokens" = GREATEST("heldTokens" - ${Number(tokens)}, 0)
-       WHERE "billingAccountId" = ${account} AND "date" = ${month}`
-    invalidateUsageCache(account)
+  async settle(id, { outcome, tokens }) {
+    if (id === NO_HOLD.id) return
+    const now = new Date()
+    // A call that ran inside a turn keeps counting at what it used until the
+    // turn is charged. Anything else is released: it never ran, its answer was
+    // lost (the customer pays nothing), or no turn will ever charge it.
+    await prisma.aiCreditHold.updateMany({
+      where: { id, status: 'reserved', turnScoped: true },
+      data:
+        outcome === 'ran'
+          ? { status: 'used', usedTokens: Math.max(0, Math.ceil(tokens ?? 0)), settledAt: now, expiresAt: new Date(now.getTime() + USED_HOLD_TTL_MINUTES * 60_000) }
+          : { status: 'released', settledAt: now },
+    })
+    await prisma.aiCreditHold.updateMany({
+      where: { id, status: 'reserved', turnScoped: false },
+      data: { status: 'released', settledAt: now },
+    })
   },
+}
+
+/**
+ * End a turn's credit accounting: charge `chargeTokens` to the account, then
+ * stop counting the turn's settled holds. A turn charged nothing releases
+ * them. Holds still in flight (a call outlived the turn, as on a timeout) are
+ * left to settle and expire on their own, so they keep counting meanwhile.
+ *
+ * Never throws: it runs after the turn's answer is decided.
+ */
+export async function closeCreditTurn(account: string | null, scope: TokenScope, chargeTokens: number): Promise<void> {
+  const charging = account !== null && Number.isFinite(chargeTokens) && chargeTokens > 0
+  if (charging) {
+    try {
+      await chargeAiCredits(account, chargeTokens)
+    } catch (err) {
+      // The holds stay counted until they expire: never uncounted.
+      console.error('[AiCredits] charging the turn failed; its holds stay counted until they expire:', err instanceof Error ? err.message : err)
+      return
+    }
+  }
+  if (scope.holds.length === 0) return
+  await prisma.aiCreditHold
+    .updateMany({
+      where: { id: { in: scope.holds }, status: 'used' },
+      data: { status: charging ? 'charged' : 'released' },
+    })
+    .catch((err) => console.error('[AiCredits] closing the turn’s holds failed; they expire on their own:', err instanceof Error ? err.message : err))
+  if (account) invalidateUsageCache(account)
 }

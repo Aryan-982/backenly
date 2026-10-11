@@ -784,12 +784,14 @@ export async function POST(request: NextRequest) {
       { status: 500 },
     ))
   } finally {
-    if (metered && tokenScope.tokens > 0) {
-      Promise.all([import('@/lib/entitlements/policy'), import('@/lib/usage/account')])
-        .then(async ([{ chargeAiCredits }, { creditAccountOf }]) => {
-          const account = await creditAccountOf(auth.projectId)
-          if (account) await chargeAiCredits(account, tokenScope.tokens)
-        })
+    // Charge a metered tool's tokens, then close its credit holds. A tool that
+    // is not metered still releases any hold a model call inside it took.
+    const charge = metered ? tokenScope.tokens : 0
+    if (charge > 0 || tokenScope.holds.length > 0) {
+      Promise.all([import('@/lib/entitlements/credit-holds'), import('@/lib/usage/account')])
+        .then(async ([{ closeCreditTurn }, { creditAccountOf }]) =>
+          closeCreditTurn(await creditAccountOf(auth.projectId), tokenScope, charge),
+        )
         .catch(() => {})
     }
   }
