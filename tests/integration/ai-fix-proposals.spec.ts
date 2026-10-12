@@ -102,9 +102,15 @@ afterAll(async () => {
 describe('the first AI repair class: add the column the intent recorded', () => {
   it('goes from fault to a verified fix with Undo, only on a person’s approval of that exact version', async () => {
     const finding = await fileDriftFinding()
-    setProviderForTests(scriptedProvider([answerProposing()]))
+    const provider = scriptedProvider([answerProposing()])
+    setProviderForTests(provider)
 
     await diagnoseEscalatedFindings(projectId)
+
+    // The model was offered exactly this typed repair, and nothing else.
+    const schema = (provider.calls[0].params.output_config as any).format.schema
+    expect(schema.properties.proposedAction.anyOf[1].properties.action.enum).toEqual(['ADD_COLUMN'])
+    expect(JSON.stringify(provider.calls[0].params.messages[0])).toContain('- ADD_COLUMN: ')
 
     // Proposed, queued for a person, and nothing has run.
     const proposal = await prisma.aiFixProposal.findFirstOrThrow({ where: { projectId, findingId: finding.id } })
