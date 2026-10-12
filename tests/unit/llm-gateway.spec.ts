@@ -12,12 +12,18 @@ import { capsFor, canonicalModel, clampEffort } from '@/lib/ai/llm/models'
 import { AiError, classifyProviderError } from '@/lib/ai/llm/errors'
 import { generate, setProviderForTests, setRetryDelayForTests, normalizeUsage } from '@/lib/ai/llm'
 import { scriptedMessage, scriptedProvider } from '@/lib/ai/llm/providers/scripted'
+import { memorySpendLedger, setSpendLedgerForTests } from '@/lib/ai/llm/spend'
 
 const user = (text: string): Anthropic.MessageParam => ({ role: 'user', content: text })
+
+// Spend is reserved and settled on every call; these tests keep it in memory.
+// tests/unit/llm-spend.spec.ts covers the reservation rules.
+beforeEach(() => setSpendLedgerForTests(memorySpendLedger()))
 
 afterEach(() => {
   setProviderForTests(null)
   setRetryDelayForTests(null)
+  setSpendLedgerForTests(null)
 })
 
 describe('provider selection', () => {

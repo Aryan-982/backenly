@@ -12,6 +12,7 @@ import OpenAI from 'openai'
 import type Anthropic from '@anthropic-ai/sdk'
 import { AiError } from '../errors'
 import type { LlmProvider } from '../types'
+import { normalizeUsage } from '../usage'
 
 type ChatMessage = OpenAI.Chat.ChatCompletionMessageParam
 type ChatPart = OpenAI.Chat.ChatCompletionContentPart
@@ -136,9 +137,11 @@ export function fromOpenAI(completion: OpenAI.Chat.ChatCompletion): Anthropic.Me
     try {
       input = call.function.arguments ? JSON.parse(call.function.arguments) : {}
     } catch {
+      // It ran and its usage is known, so the run can still be settled.
       throw new AiError('output_invalid', `Tool "${call.function.name}" arguments were not valid JSON.`, {
         provider: 'openai',
         consumption: 'ran',
+        usage: normalizeUsage(usage),
       })
     }
     content.push({ type: 'tool_use', id: call.id, name: call.function.name, input } as Anthropic.ToolUseBlock)
