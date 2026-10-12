@@ -5699,6 +5699,8 @@ async function executeDropTable(params: any, projectId: string): Promise<Executi
     await prisma.$executeRawUnsafe(`DROP TABLE IF EXISTS "${postgresSchema}"."${tableName}" CASCADE`)
     await prisma.table.deleteMany({ where: { projectId, name: tableName } })
     await prisma.apiDefinition.deleteMany({ where: { projectId, name: tableName } })
+    const { supersedeSchemaIntent } = await import('@/lib/autonomy/intent-conformance')
+    await supersedeSchemaIntent(projectId, { kind: 'drop_table', tableName })
 
     // Best-effort: strip the entity from the BackendStateGraph so graph-based
     // API counts stay in sync. Failure here must never block the deletion itself.
@@ -6049,6 +6051,11 @@ async function executeDropColumn(params: any, projectId: string): Promise<Execut
     await prisma.$executeRawUnsafe(
       `ALTER TABLE "${postgresSchema}"."${tableName}" DROP COLUMN IF EXISTS "${columnName}" CASCADE`
     )
+
+    // The drop was asked for, so the column is no longer requested: without
+    // this the intent ledger would report it missing (lib/autonomy/intent-conformance).
+    const { supersedeSchemaIntent } = await import('@/lib/autonomy/intent-conformance')
+    await supersedeSchemaIntent(projectId, { kind: 'drop_column', tableName, columnName })
 
     // Regenerate the REST API for this table so the column disappears from
     // its generated CRUD payloads. Non-fatal — the column is gone either way.
@@ -8697,6 +8704,11 @@ async function executeRenameColumn(params: any, projectId: string, target: Schem
     await prisma.$executeRawUnsafe(
       `ALTER TABLE "${postgresSchema}"."${safe(tableName)}" RENAME COLUMN "${safe(oldName)}" TO "${safe(newName)}"`
     )
+    // The ledger describes MAIN; a branch's rename is applied when it is merged.
+    if (!target.targetSchema) {
+      const { supersedeSchemaIntent } = await import('@/lib/autonomy/intent-conformance')
+      await supersedeSchemaIntent(projectId, { kind: 'rename_column', tableName: safe(tableName), from: safe(oldName), to: safe(newName) })
+    }
     // Column renamed — evict cached Zod validation schema
     import('@/lib/services/workspace-validator').then(({ invalidateSchemaCache }) => invalidateSchemaCache(projectId, tableName)).catch(() => {})
     return {

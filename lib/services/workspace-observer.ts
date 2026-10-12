@@ -20,6 +20,7 @@
 
 import { prisma } from '@/lib/db/prisma'
 import { detectSubsystemRecurrence } from '@/lib/autonomy/subsystem-recurrence'
+import { detectIntentDrift } from '@/lib/autonomy/intent-conformance'
 import { probeQueryFailed } from '@/lib/core/drift-detector'
 import { queryWorkspaceSchema, executeInWorkspaceSchema } from './workspaceDatabase'
 import { applyPermissionPolicy } from './workspace-rls'
@@ -398,6 +399,12 @@ async function observeProject(projectId: string, result: ObserverResult): Promis
     // only from the WOULD_AUTO_APPLY branch. The observer is the path that
     // persists non-auto findings, which is what this is.
     detectSubsystemRecurrence(projectId),
+    // A column the developer asked for that the database no longer has, or has
+    // as a different kind of thing. The per-minute loop evaluates this invariant
+    // but, like every notify_only gap, never mints a finding for it, so without
+    // this line it was detected every minute and recorded nowhere: nobody was
+    // told, and the investigator, which reads findings, never saw one.
+    detectIntentDrift(projectId),
   ]
 
   const settled = await Promise.allSettled(detectors)
@@ -837,6 +844,9 @@ async function writeFinding(
     // reaped — which is exactly the continuity reset the fingerprint cannot
     // provide, since a table joining the component can move it.
     subsystem_repeat_failure: 'membershipHash',
+    // One row per drifted column (`table.column`): two missing columns are two
+    // repairs, and each one's proposal is bound to its own finding.
+    intent_drift: 'location',
   }
 
   const discriminatorKey = DISCRIMINATOR[finding.type]
