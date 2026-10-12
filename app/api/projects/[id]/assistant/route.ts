@@ -14,7 +14,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { withProjectValidation } from '@/lib/middleware/projectValidation'
 import { enforceAiChatRateLimit, getRateLimitHeaders } from '@/lib/middleware/rateLimiter'
-import { chatCompletionStream, isAIEnabled } from '@/lib/openai/client'
+import { AiError, aiAvailability } from '@/lib/ai/llm'
+import { chat } from '@/lib/ai/llm/chat'
 import { assistantPrompt } from '@/lib/ai/brain/prompts'
 import { buildConnectManifest } from '@/lib/services/connect-manifest'
 import { resolvePublicBaseUrl } from '@/lib/services/public-url'
@@ -23,7 +24,6 @@ import { agentConnectionFor } from '@/lib/mcp/agent-connection'
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 
-const ASSISTANT_MODEL = process.env.OPENAI_MODEL_FAST || 'gpt-4o-mini'
 const MAX_TURNS = 12
 const MAX_MESSAGE_CHARS = 4_000
 
@@ -79,7 +79,7 @@ async function buildProjectContext(projectId: string, projectName: string, origi
 
 export async function POST(request: NextRequest) {
   return withProjectValidation(request, async ({ projectId, userId, project }) => {
-    if (!isAIEnabled()) {
+    if (!aiAvailability().available) {
       return NextResponse.json(
         { error: 'The assistant is not available right now.' },
         { status: 503 },
@@ -109,16 +109,21 @@ export async function POST(request: NextRequest) {
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         try {
-          const tokens = chatCompletionStream(
-            [{ role: 'system', content: assistantPrompt(projectContext) }, ...messages],
-            { model: ASSISTANT_MODEL, temperature: 0.4, maxTokens: 700 },
-          )
-          for await (const token of tokens) {
-            controller.enqueue(encoder.encode(token))
-          }
+          // Shown as it is written: the gateway streams the text out as Claude
+          // produces it (the OpenAI adapter sends it whole, at the end).
+          await chat({
+            purpose: 'brain.answer',
+            messages: [{ role: 'system', content: assistantPrompt(projectContext) }, ...messages],
+            maxTokens: 1024,
+            onText: (delta) => controller.enqueue(encoder.encode(delta)),
+            billing: { projectId },
+            label: 'assistant',
+          })
         } catch (err) {
           console.error('[assistant] stream failed:', err)
-          controller.enqueue(encoder.encode('Something went wrong answering that. Try again in a moment.'))
+          controller.enqueue(
+            encoder.encode(err instanceof AiError ? err.userMessage : 'Something went wrong answering that. Try again in a moment.'),
+          )
         } finally {
           controller.close()
         }

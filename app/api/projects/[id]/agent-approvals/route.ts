@@ -8,8 +8,9 @@ export const dynamic = 'force-dynamic'
  *
  * POST /api/projects/[id]/agent-approvals
  *   Body: { approvalId: string, decision: 'approve' | 'reject' }
- *   Approving executes the parked operation immediately (brain replay with
- *   destructiveConfirmed=true) and returns the outcome.
+ *   Approving executes the parked operation immediately — the exact tool and
+ *   arguments recorded on the request, verbatim, with no model involved — and
+ *   returns the outcome. A request without an exact call is closed unrun.
  *
  * Auth: platform JWT + project ownership (withProjectAccess). Scoped agent
  * keys can create and poll requests over MCP but can never decide them —

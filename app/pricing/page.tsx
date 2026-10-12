@@ -271,7 +271,7 @@ const faqs = [
   },
   {
     q: 'Can I self-host Backenly instead of paying?',
-    a: 'Yes. The platform is open source under Apache-2.0 and free to self-host: you bring the servers, the Postgres, and an OpenAI key if you want the natural-language build tools (the self-healing loop itself needs no model). The plans on this page are Backenly Cloud, where we run the infrastructure and handle backups and upgrades. It is the same codebase either way, and pg_dump moves your data between the two.',
+    a: 'Yes. The platform is open source under Apache-2.0 and free to self-host: you bring the servers, the Postgres, and an AI provider key (Claude or OpenAI) if you want the natural-language build tools (the self-healing loop itself needs no model). The plans on this page are Backenly Cloud, where we run the infrastructure and handle backups and upgrades. It is the same codebase either way, and pg_dump moves your data between the two.',
   },
   {
     q: 'What counts as an AI credit?',

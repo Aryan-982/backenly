@@ -125,7 +125,7 @@ npm run dev               # dashboard :3000 · runtime :3001`,
           ],
           you: [
             'The servers, the PostgreSQL instance, backups, and TLS.',
-            'Your own OpenAI key, and the cost of planning and generation on it.',
+            'Your own AI provider key (Claude or OpenAI), and the cost of planning and generation on it.',
             'Upgrades, and the schema sync that goes with them.',
             'Reverse-proxy configuration, and keeping the two processes supervised so a crash restarts.',
           ],
