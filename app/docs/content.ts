@@ -95,7 +95,7 @@ export const DOC_HEADINGS = [
   { id: 'notes', label: 'Good to know' },
 ] as const
 
-export const DOCS_UPDATED = { iso: '2026-10-11', display: 'October 11, 2026' } as const
+export const DOCS_UPDATED = { iso: '2026-10-12', display: 'October 12, 2026' } as const
 
 export const DOC_GROUPS: DocGroup[] = [
   {
@@ -149,8 +149,8 @@ export const DOC_SECTIONS: DocSection[] = [
         body: 'With ordinary PostgreSQL DDL through `apply_migration`, or by describing the tables to `backend_chat`. Either way Backenly turns the request into typed actions rather than running raw SQL, and refuses anything it cannot map.',
       },
       {
-        title: 'Backenly applies it as one change',
-        body: 'The tables are created in your project’s own PostgreSQL schema, all or nothing. The schema is snapshotted first, so the change can be rolled back to a saved version.',
+        title: 'Backenly applies the checked steps',
+        body: 'Tables are created in your project’s own PostgreSQL schema, with a schema snapshot before a change. A multi-statement migration is checked before any step runs; if execution fails, it stops and reports what applied and what remains, so your agent can finish without replaying completed work.',
       },
       {
         title: 'Every table gets an API',
@@ -478,7 +478,7 @@ await backend.auth.signIn({ email, password })
     ],
     notes: [
       'No mode can apply auth, destructive or irreversible changes on its own. That floor is not a setting.',
-      'Autonomy runs no language model, so its checks and fixes use no AI credits.',
+      'Routine checks and safe repairs are deterministic and use no AI credits. When those checks cannot explain a finding, an AI investigation can gather read-only evidence and suggest a typed repair. Its explanation is labelled as a hypothesis, and any proposed repair waits for a person’s approval. On Cloud, Backenly pays for these investigations.',
       'A project with no traffic, no changes and no other activity for 30 days is not checked until activity returns.',
       'Rolling back to a restore point keeps anything added since. OAuth providers and functions have to be reconnected by hand.',
     ],
@@ -657,6 +657,7 @@ await backend.auth.signIn({ email, password })
     },
     notes: [
       'Destructive operations, such as dropping a table, never run straight from an agent. They wait for a person in the [Autonomy](/docs/autonomy) review queue.',
+      'After approval, the exact parked call runs without being reinterpreted. Poll `check_approval` until its status is final. If it fails, read `resultSummary` and check the current state before asking again, because a call can stop after applying part of its work.',
       'A key is a credential. Keep it out of your repository, and revoke keys you stop using in [Settings](/docs/settings).',
       '`pg_dump` exports (full, schema only, or data only) restore on any PostgreSQL, so your data is never locked in.',
     ],
