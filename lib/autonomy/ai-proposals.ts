@@ -49,6 +49,12 @@ interface FindingView {
 
 interface ProposableAction {
   params: z.ZodType<Record<string, unknown>>
+  /** The same parameters as JSON Schema, for the investigator's answer (lib/autonomy/investigator.ts). */
+  paramsSchema: Record<string, unknown>
+  /** One line telling the investigator when to use it. */
+  use: string
+  /** Whether this action can repair this kind of finding at all, before any parameters. */
+  applies(finding: FindingView): boolean
   rollback: RollbackStrategy
   schemaTouching: boolean
   /** Null when this action repairs this finding; otherwise why not. */
@@ -75,6 +81,18 @@ const PROPOSABLE: Record<string, ProposableAction> = {
     params: z
       .object({ tableName: z.string().regex(IDENT), columnName: z.string().regex(IDENT), columnType: z.enum(COLUMN_TYPES) })
       .strict(),
+    paramsSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['tableName', 'columnName', 'columnType'],
+      properties: {
+        tableName: { type: 'string' },
+        columnName: { type: 'string' },
+        columnType: { type: 'string', enum: [...COLUMN_TYPES] },
+      },
+    },
+    use: 'Add the one column a missing-column finding names to its table, in the type family that was requested.',
+    applies: (finding) => finding.base === 'intent_drift' && finding.details.driftKind === 'missing_column',
     rollback: 'drop_column',
     schemaTouching: true,
     repairs(finding, p) {
@@ -96,6 +114,28 @@ const PROPOSABLE: Record<string, ProposableAction> = {
       return crypto.createHash('sha256').update(`${p.tableName}|${shape}`).digest('hex').slice(0, 32)
     },
   },
+}
+
+/** A typed repair the investigator may propose, as the model is told about it. */
+export interface ProposalSpec {
+  action: string
+  use: string
+  params: Record<string, unknown>
+}
+
+/**
+ * The typed repairs an investigation of this finding may propose, empty when
+ * none applies. The investigator is held to these: without them it was told
+ * only "an action name and its parameters", and Claude proposed the detector's
+ * own raw SQL through apply_migration, which no proposal may run (staging,
+ * 2026-10-12). Everything here is still re-checked when the proposal is made.
+ */
+export function proposableFor(finding: { type: string; details: Record<string, unknown> }): ProposalSpec[] {
+  const base = normalizeFindingType(finding.type, finding.details)?.base ?? finding.type
+  const view: FindingView = { type: finding.type, base, details: finding.details }
+  return Object.entries(PROPOSABLE)
+    .filter(([, spec]) => spec.applies(view))
+    .map(([action, spec]) => ({ action, use: spec.use, params: spec.paramsSchema }))
 }
 
 /** One plain line for what a proposal would do. */

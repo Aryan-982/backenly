@@ -38,7 +38,7 @@ import { classifyFix } from '@/lib/core/fix-classifier'
 import { resolveWorkspaceSchema } from '@/lib/services/workspace-pool'
 import { investigateFinding, type CatalogTable, type Investigation } from './investigator'
 import { evidenceFingerprint } from './finding-fingerprint'
-import { proposeRepair } from './ai-proposals'
+import { proposableFor, proposeRepair } from './ai-proposals'
 
 const MAX_PER_TICK = 2
 /** Model investigations per project per 24h. Deterministic ones are not counted. */
@@ -256,6 +256,7 @@ export async function diagnoseEscalatedFindings(projectId: string): Promise<numb
                 (a) => `${a.timestamp.toISOString()} ${a.action} ${String(a.details ?? '').slice(0, 140)}`,
               ),
               priorAttempts: prior?.history ?? [],
+              proposable: proposableFor({ type: finding.type, details }),
             },
             (probe, probeTable) => PROBE_REGISTRY[probe]({ projectId, table: probeTable ?? table }),
             Object.keys(PROBE_REGISTRY),
