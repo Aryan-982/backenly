@@ -223,8 +223,8 @@ export async function checkBreaker(projectId: string): Promise<BreakerDecision> 
  *
  * Paths that already write a recognised AUTONOMOUS_AUDIT_ACTIONS row on success
  * (auto-fix-engine) do NOT need to call this — their existing audit write is
- * the ledger entry. Paths that previously wrote nothing (agent-orchestrator)
- * call this so every autonomous action is counted consistently.
+ * the ledger entry. A path that writes no such row of its own calls this, so
+ * every autonomous action is counted consistently.
  */
 export async function recordAutonomousAction(
   projectId: string,
