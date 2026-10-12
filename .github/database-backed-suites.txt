@@ -621,6 +621,12 @@ tests/integration/ai-fix-proposals.spec.ts
 # Postgres.
 tests/integration/ai-lab-arm.spec.ts
 
+# AI credit holds: a customer-paid call's worst case held on the account's usage
+# row before it is sent, one conditional update so racing calls cannot both
+# take the last credits, released on settle, stale after a crash, never a
+# charge. The row and the race are real, so it needs a real Postgres.
+tests/integration/ai-credit-holds.spec.ts
+
 # Every meter measures what lib/usage/axes.ts says: streamed egress bytes once and
 # never for internal traffic, MAU once per user per month, database size including
 # branch schemas, file size from metadata, and function runs that executed.

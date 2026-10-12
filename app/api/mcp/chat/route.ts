@@ -16,8 +16,10 @@ export const dynamic = 'force-dynamic'
  *      gateway (lib/ai/llm), which reserves it against the deployment's monthly
  *      AI limits and writes `ai_usage` (model, tokens, cost, endpoint). That is
  *      our model spend, for our own accounting. It charges the user nothing.
- *   2. USER CREDITS. `enforceAiCredits` gates the turn and `chargeAiCredits`
- *      debits the tokens the turn actually burned (`result.tokensUsed`).
+ *   2. USER CREDITS. `enforceAiCredits` gates the turn, each model call holds
+ *      its worst case against the credits before it is sent, and
+ *      `closeCreditTurn` debits the tokens the turn actually burned
+ *      (`result.tokensUsed`), then stops the holds counting.
  *
  * (2) was written but never called — for a long time `backend_chat` ran a full
  * multi-step model loop on our key with no user-facing cap at all, on any plan.
@@ -35,7 +37,9 @@ import { corsHeaders, optionsResponse } from '@/lib/mcp/cors'
 import { runBrain, type BrainEvent } from '@/lib/ai/brain/agent'
 import { assertAiAllowed } from '@/lib/platform-controls'
 import { createApprovalRequest } from '@/lib/mcp/approvals'
-import { enforceAiCredits, chargeAiCredits } from '@/lib/entitlements/policy'
+import { enforceAiCredits } from '@/lib/entitlements/policy'
+import { closeCreditTurn } from '@/lib/entitlements/credit-holds'
+import { createTokenScope, runInTokenScope } from '@/lib/ai/token-meter'
 import { creditAccountOf } from '@/lib/usage/account'
 
 const MAX_BRAIN_MS = 90_000
@@ -144,10 +148,13 @@ export async function POST(request: NextRequest) {
   // worth charging for.
   let spentTokens = 0
   let charged = false
+  // The turn's credit holds are taken inside this scope and closed with the
+  // charge, after it is recorded (lib/entitlements/credit-holds.ts).
+  const creditScope = createTokenScope()
   const chargeOnce = () => {
-    if (charged || spentTokens <= 0) return
+    if (charged) return
     charged = true
-    if (creditAccount) chargeAiCredits(creditAccount, spentTokens).catch(() => {})
+    closeCreditTurn(creditAccount, creditScope, spentTokens).catch(() => {})
   }
 
   const timeoutPromise = new Promise<never>((_, reject) => {
@@ -159,7 +166,7 @@ export async function POST(request: NextRequest) {
 
   try {
     const result = await Promise.race([
-      runBrain(
+      runInTokenScope(creditScope, () => runBrain(
         {
           projectId: auth.projectId,
           userId: auth.userId,
@@ -180,7 +187,7 @@ export async function POST(request: NextRequest) {
           onTokens: (n) => { spentTokens += n },
         },
         (e) => events.push(e),
-      ),
+      )),
       timeoutPromise,
     ])
 

@@ -52,12 +52,22 @@ Every unknown booking is logged.
 
 ## Customer billing
 
-A deployment that bills customers registers a `CustomerSpendHook`:
+Customer-paid calls go through a `CustomerSpendHook`. The default is the credit hold in `lib/entitlements/credit-holds.ts`, one `ai_credit_holds` row per call with its own expiry:
 
-- `reserve` holds credits for the worst case, and can refuse with `credits_exhausted`;
-- `settle` charges the real cost when inference ran, and nothing otherwise.
+| State | When | Counts against the cap |
+|---|---|---|
+| `reserved` | Before the call is sent, taken under a per-account lock only if credits already charged + every live hold + this call's worst case fit. Otherwise the call is refused unsent with `credits_exhausted`. | Its worst case |
+| `used` | The call ran inside a turn. | What it actually used, until the turn is charged |
+| `charged` | The turn was charged (`closeCreditTurn`). | No, the usage is in the charged total now |
+| `released` | The call never ran, its answer was lost, its turn was charged nothing, or it ran outside any turn. | No |
 
-A self-hosted install registers none and bills nobody. The deployment's own limits apply either way.
+`closeCreditTurn` charges first, then marks the turn's holds charged. In between, usage is counted twice, which is the safe direction; it is never counted zero times, so a finished call can no longer leave a gap another call slips into. If the charge fails, the holds stay counted until they expire: a billing fault can cost revenue but never lets an account overspend. The charge is Cloud's commercial write (`recordAiConsumption`), which is why the two steps are ordered rather than one transaction.
+
+Settling only moves a hold out of `reserved`, so a late settlement after its turn closed changes nothing. A reserved hold expires with the gateway's own reservation; a used one 15 minutes after its call. Each hold expires on its own, so a busy account never keeps a stranded one alive.
+
+The customer is never charged for a call that did not run or whose answer was lost. A hold that cannot be written refuses the call with `spend_unavailable`. Where there are no finite credits (a self-hosted install, an unlimited plan, or entitlements that cannot be read), nothing is held. The deployment's own limits apply either way. `setCustomerSpendHook(null)` turns holds off.
+
+Platform-paid calls (`autonomy.*`: investigations and repair proposals) never touch customer credits. They count only against the deployment's own limits.
 
 ## Where to look
 
