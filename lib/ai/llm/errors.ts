@@ -67,6 +67,8 @@ export class AiError extends Error {
   usage?: NormalizedUsage
   /** Requests sent before giving up. */
   attempts = 1
+  /** The model the request was routed to, once it got that far: what prices `usage`. */
+  model?: string
 
   constructor(
     kind: AiErrorKind,

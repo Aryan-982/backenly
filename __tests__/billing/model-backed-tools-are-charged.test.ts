@@ -179,6 +179,13 @@ describe('the billing contract is wired at every boundary', () => {
     expect(read('lib/openai/client.ts')).toContain('attachTokenMeter')
   })
 
+  it('the AI gateway reports every call that ran into the meter', () => {
+    // The brain's answer_question runs through the gateway, and the MCP tool
+    // route charges it from this meter. tests/unit/llm-gateway.spec.ts shows
+    // the behaviour; this pins the boundary that carries it.
+    expect(read('lib/ai/llm/index.ts')).toContain('recordTokens(')
+  })
+
   it('the MCP tool route both gates AND charges its model-backed tools', () => {
     const route = read('app/api/mcp/tool/route.ts')
 

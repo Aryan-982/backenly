@@ -12,12 +12,10 @@
  *   - Destructive tools are flagged so the agent loop can gate them.
  */
 
-import type { OpenAI } from 'openai'
 import { executeAction } from '../minimal-executor'
 import type { AIAction } from '../minimal-executor'
 import { collectProof, formatProof } from '../proof-system'
-import { getOpenAIClient, trackCompletionCost } from '../openai-service'
-import { getModel } from '../model-router'
+import { AiError, generate } from '../llm'
 import { answererPrompt } from './prompts'
 import { kickReconciler, shouldKickFor } from '@/lib/autonomy/event-trigger'
 import { WEBHOOK_EVENT_TYPES } from '@/lib/webhooks/events'
@@ -375,9 +373,24 @@ export interface ToolResult {
  */
 export const AGENT_ONLY_TOOLS = new Set<string>(['deploy_function_code'])
 
-// ── OpenAI tool schema ────────────────────────────────────────────────────────
+// ── Tool schema ───────────────────────────────────────────────────────────────
 
-export const BRAIN_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+/**
+ * One tool of the catalog: its name, what it is for, and a JSON Schema for its
+ * arguments. The MCP surface reads this catalog too, so it keeps one
+ * provider-neutral shape; lib/ai/brain/model.ts translates it for the brain's
+ * own model.
+ */
+export interface BrainToolSchema {
+  type: 'function'
+  function: {
+    name: string
+    description?: string
+    parameters: { type: 'object'; properties: Record<string, unknown>; required?: string[] }
+  }
+}
+
+export const BRAIN_TOOLS: BrainToolSchema[] = [
   fn('read_backend_state',
     'Read the live backend state: tables, REST APIs, auth status, storage buckets, RLS policies, integrations. Call this FIRST to ground every decision in reality. Side-effect free.',
     {}),
@@ -1401,7 +1414,7 @@ function fn(
   description: string,
   properties: Record<string, unknown>,
   required?: string[],
-): OpenAI.Chat.Completions.ChatCompletionTool {
+): BrainToolSchema {
   return {
     type: 'function',
     function: {
@@ -2368,24 +2381,16 @@ export async function dispatchTool(
     // ── Control: answer_question ──────────────────────────────────────────
     if (name === 'answer_question') {
       const question = String(args.question ?? ctx.userMessage ?? '').trim()
-      const openai = getOpenAIClient()
-      const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-        { role: 'system', content: answererPrompt() },
-      ]
-      if (ctx.understandingBlock) {
-        messages.push({ role: 'system', content: `THIS PROJECT:\n${ctx.understandingBlock}` })
-      }
-      messages.push({ role: 'user', content: question || 'Can you help me?' })
-
       try {
-        const completion = await openai.chat.completions.create({
-          model: getModel('respond'),
-          messages,
-          temperature: 0.3,
-          max_tokens: 600,
+        const result = await generate({
+          purpose: 'brain.answer',
+          system: answererPrompt(),
+          ...(ctx.understandingBlock ? { context: `THIS PROJECT:\n${ctx.understandingBlock}` } : {}),
+          messages: [{ role: 'user', content: question || 'Can you help me?' }],
+          billing: { projectId: ctx.projectId },
+          label: 'brain-answer',
         })
-        if (ctx.projectId) trackCompletionCost(completion, ctx.projectId, 'brain-answer')
-        const text = completion.choices[0]?.message?.content?.trim() ?? 'I don\'t have a confident answer for that.'
+        const text = result.text.trim() || 'I don\'t have a confident answer for that.'
         return finalize({
           ok: true,
           summary: text,
@@ -2393,9 +2398,12 @@ export async function dispatchTool(
           data: { kind: 'answer' },
         })
       } catch (err) {
+        // Say why, in words a person can act on. Never the provider's own text.
         return finalize({
           ok: false,
-          summary: 'I hit an error trying to answer that. Could you try again?',
+          summary: err instanceof AiError
+            ? `I couldn't answer that. ${err.userMessage}`
+            : 'I hit an error trying to answer that. Could you try again?',
         })
       }
     }
