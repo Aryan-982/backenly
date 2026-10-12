@@ -63,6 +63,14 @@ interface PendingApproval {
 interface FindingDiagnosis {
   rootCause?: string
   recommendation?: string
+  /**
+   * Where it came from. A deterministic investigation reached its conclusion
+   * from observations it made; a model-written diagnosis is a hypothesis that
+   * nothing has verified. They must never look the same on screen.
+   */
+  provenance: 'investigation' | 'ai_hypothesis'
+  /** Observations an investigation made (its evidence trail), when recorded. */
+  observations: number | null
 }
 
 interface TrustReportShape {
@@ -154,7 +162,12 @@ function diagnosisOf(p: PendingApproval): FindingDiagnosis | null {
   if (!d || typeof d !== 'object') return null
   const rootCause = typeof d.rootCause === 'string' ? d.rootCause : undefined
   const recommendation = typeof d.recommendation === 'string' ? d.recommendation : undefined
-  return rootCause || recommendation ? { rootCause, recommendation } : null
+  if (!rootCause && !recommendation) return null
+  // Only the deterministic investigation is labelled as such; anything else,
+  // including a diagnosis with no recorded source, is shown as a hypothesis.
+  const provenance = d.model === 'deterministic-investigation' ? 'investigation' : 'ai_hypothesis'
+  const observations = Array.isArray(d.evidence) ? d.evidence.length : null
+  return { rootCause, recommendation, provenance, observations }
 }
 
 function timeAgo(iso: string): string {
@@ -709,6 +722,11 @@ function ApprovalRow({
             if (!diag) return null
             return (
               <div className="mt-1.5 border-l border-white/[0.08] pl-3">
+                <p className="mb-0.5 text-[11.5px] font-medium uppercase tracking-wide text-zinc-500">
+                  {diag.provenance === 'investigation'
+                    ? `Confirmed by investigation${diag.observations ? ` · ${diag.observations} observation${diag.observations === 1 ? '' : 's'}` : ''}`
+                    : 'AI hypothesis · not verified'}
+                </p>
                 {diag.rootCause && (
                   <p className="text-[12.5px] leading-snug text-zinc-400">{diag.rootCause}</p>
                 )}
