@@ -595,6 +595,38 @@ tests/integration/ai-spend-ledger.spec.ts
 # workspace schema and its conversation, so it needs a real Postgres.
 tests/integration/brain-on-gateway.spec.ts
 
+# /v1/{projectId}/ai/generate: model names resolve to the deployment's aliases,
+# the output is capped, the project's credits gate and pay for it, and a provider
+# failure answers with a code and plain words. It reads the project and writes
+# its usage row, so it needs a real Postgres.
+tests/integration/runtime-generate.spec.ts
+
+# Escalated findings: the deterministic investigation first, then the model
+# investigator with real read-only probes, a checked hypothesis stored as one,
+# once per evidence, with backoff after failures. The probes read the
+# project's catalog, so it needs a real Postgres.
+tests/integration/escalation-investigation.spec.ts
+
+# The first AI repair class end to end: a lab fault, a bound proposal, a person's
+# approval of that exact version, governed execution checked three ways, Undo,
+# and the stale, double-approval, ineligible and resolve_finding guards. It
+# alters a workspace table and restores it, so it needs a real Postgres.
+tests/integration/ai-fix-proposals.spec.ts
+
+# The lab's AI arm: each fault seeded, broken, filed by its canonical detector
+# and handed to the investigator (a scripted model), measured as gates (no
+# unapproved mutation, no false "fixed", no model call on a healthy backend
+# with nothing escalated)
+# separately from utility. It seeds and alters lab schemas, so it needs a real
+# Postgres.
+tests/integration/ai-lab-arm.spec.ts
+
+# AI credit holds: a customer-paid call's worst case held on the account's usage
+# row before it is sent, one conditional update so racing calls cannot both
+# take the last credits, released on settle, stale after a crash, never a
+# charge. The row and the race are real, so it needs a real Postgres.
+tests/integration/ai-credit-holds.spec.ts
+
 # Every meter measures what lib/usage/axes.ts says: streamed egress bytes once and
 # never for internal traffic, MAU once per user per month, database size including
 # branch schemas, file size from metadata, and function runs that executed.

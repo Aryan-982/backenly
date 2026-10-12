@@ -41,6 +41,16 @@ export function effectiveTokensOf(model: string, usage: NormalizedUsage): number
 }
 
 /**
+ * The same worst case as maxCostOf, in effective tokens: the unit AI credits
+ * count, and what a customer's credit hold is sized by.
+ */
+export function maxEffectiveTokensOf(model: string, params: Anthropic.MessageCreateParamsNonStreaming): number {
+  const chars = JSON.stringify([params.system ?? '', params.messages, params.tools ?? []]).length
+  const promptTokens = Math.ceil(chars / 3)
+  return effectiveTokens(promptTokens, params.max_tokens, 0, { model, cacheWrite: { tokens5m: promptTokens } })
+}
+
+/**
  * The most a request can cost, for reserving it before it is sent: every prompt
  * token priced as a cache write (the dearest way it can bill here) and the full
  * output ceiling. The prompt is estimated at three characters a token, more

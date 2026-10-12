@@ -177,6 +177,7 @@ model Project {
   deployConfirmations     DeployConfirmation[]
   aiConfiguration         AiConfiguration?
   aiUsage                 AiUsage[]
+  aiFixProposals          AiFixProposal[]
   anomalies               Anomaly[]
   apiKeys                 ApiKey[]
   apiRequestLogs          ApiRequestLog[]
@@ -1297,6 +1298,40 @@ model AiSpendPeriod {
   @@map("ai_spend_periods")
 }
 
+/// A repair an AI investigation proposed for one finding, bound to the exact
+/// evidence, parameters and catalog state it was proposed against. It runs only
+/// when a person approves that exact version (lib/autonomy/ai-proposals.ts),
+/// and only once: approval claims it with a conditional update.
+model AiFixProposal {
+  id                  String    @id @default(uuid())
+  projectId           String
+  findingId           String
+  /// pending | executing | executed | failed | rejected | stale | expired
+  status              String    @default("pending")
+  action              String
+  params              Json
+  /// Binds project, finding, evidence, action, params, the touched catalog,
+  /// the rollback contract and the verifier version. Approval must present it.
+  proposalVersion     String
+  evidenceFingerprint String
+  catalogFingerprint  String
+  model               String
+  rationale           String    @db.Text
+  expiresAt           DateTime
+  /// Set by the one approval that claimed it.
+  executionId         String?
+  decidedBy           String?
+  decidedAt           DateTime?
+  outcome             Json?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  project             Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, status])
+  @@index([findingId])
+  @@map("ai_fix_proposals")
+}
+
 /// One call's reservation. A call that never settles (the process died) is
 /// still accounted for: past `expiresAt` it is booked as unknown usage.
 model AiSpendHold {
@@ -1362,6 +1397,31 @@ model AccountAiUsage {
   @@unique([billingAccountId, date])
   @@index([date])
   @@map("account_ai_usage")
+}
+
+/// One customer-paid model call's hold on its account's AI credits
+/// (lib/entitlements/credit-holds.ts): reserved before it is sent, used at what
+/// it consumed until its turn is charged, then charged or released. Counts
+/// against the cap only while reserved or used and unexpired.
+model AiCreditHold {
+  id               String    @id @default(uuid())
+  billingAccountId String
+  /// YYYY-MM, matching account_ai_usage.date.
+  month            String
+  /// Worst case, in effective tokens.
+  tokens           Int
+  /// What the call actually used, once it ran.
+  usedTokens       Int?
+  /// reserved | used | charged | released
+  status           String    @default("reserved")
+  /// Taken inside a turn that will be charged; a call outside one is released when it settles.
+  turnScoped       Boolean   @default(false)
+  createdAt        DateTime  @default(now())
+  expiresAt        DateTime
+  settledAt        DateTime?
+
+  @@index([billingAccountId, month, status])
+  @@map("ai_credit_holds")
 }
 
 // A billing account's two credit balances, bonus and purchased, and the last

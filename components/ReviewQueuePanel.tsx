@@ -57,6 +57,8 @@ interface PendingApproval {
   /** Always sent by the trust report; normalized to null on the way in so the
    *  grouping contract holds even against a response that predates the field. */
   details: Record<string, unknown> | null
+  /** An AI-proposed repair waiting for approval of this exact version (lib/autonomy/ai-proposals.ts). */
+  proposal?: { id: string; version: string; summary: string; expiresAt: string }
 }
 
 /** Senior-engineer diagnosis written onto escalated findings (escalation-diagnosis). */
@@ -320,6 +322,41 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
     timers.current.push(t)
   }
 
+  /**
+   * Approve one AI-proposed repair. The server re-checks everything the
+   * proposal was bound to, runs it once, and says whether all three checks
+   * confirmed it. Anything less is shown as exactly what it is.
+   */
+  const approveProposal = async (g: FindingGroup<PendingApproval>, proposal: NonNullable<PendingApproval['proposal']>) => {
+    setRow(g.key, { phase: 'applying' })
+    try {
+      const res = await fetch(`/api/projects/${projectId}/health/proposals/${proposal.id}/approve`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proposalVersion: proposal.version }),
+      })
+      const j = await res.json().catch(() => ({} as any))
+      if (res.ok && j?.fixed) {
+        setRow(g.key, { phase: 'verified' })
+        flashBanner('Fixed · verified', 'the change is in the catalog, the issue is gone on re-check, nothing else broke · Undo is in Applied changes')
+        const t = setTimeout(async () => {
+          await fetchReport(true)
+          setRowState(prev => {
+            const { [g.key]: _gone, ...rest } = prev
+            return rest
+          })
+        }, 2400)
+        timers.current.push(t)
+        return
+      }
+      setRow(g.key, { phase: 'error', message: j?.message || j?.error || 'The repair could not be applied. Try again in a moment.' })
+      if (res.status === 409 || res.ok) fetchReport(true)
+    } catch {
+      setRow(g.key, { phase: 'error', message: 'Network error. Check your connection and try again.' })
+    }
+  }
+
   const decideAgentRequest = async (approvalId: string, decision: 'approve' | 'reject') => {
     setRow(approvalId, { phase: decision === 'approve' ? 'applying' : 'dismissing' })
     try {
@@ -471,6 +508,7 @@ export function ReviewQueuePanel({ projectId }: { projectId: string }) {
               group={g}
               state={rowState[g.key] ?? { phase: 'idle' }}
               onApprove={() => approveGroup(g)}
+              onApproveProposal={(pr) => approveProposal(g, pr)}
               onDismiss={() => dismissGroup(g)}
               onResetError={() => setRow(g.key, { phase: 'idle' })}
             />
@@ -662,12 +700,14 @@ function ApprovalRow({
   group: g,
   state,
   onApprove,
+  onApproveProposal,
   onDismiss,
   onResetError,
 }: {
   group: FindingGroup<PendingApproval>
   state: RowState
   onApprove: () => void
+  onApproveProposal: (proposal: NonNullable<PendingApproval['proposal']>) => void
   onDismiss: () => void
   onResetError: () => void
 }) {
@@ -676,6 +716,8 @@ function ApprovalRow({
   const head = g.members[0]
   const critical = g.severity === 'critical'
   const many = g.members.length > 1
+  // A proposal is bound to one finding, so it is offered on single rows only.
+  const proposal = !many ? head.proposal : undefined
 
   if (state.phase === 'verified') {
     return (
@@ -775,7 +817,19 @@ function ApprovalRow({
               spends a click discovering it — and say what to do instead. The
               hint is the same sentence the approve route would have returned,
               read from the one fix mapping (lib/core/fix-actions.ts). */}
-          {!g.actionable && state.phase !== 'error' && g.manualHint && (
+          {proposal && state.phase !== 'error' && (
+            <div className="mt-2 border-l border-violet-400/30 pl-3">
+              <p className="mb-0.5 text-[11.5px] font-medium uppercase tracking-wide text-violet-300/80">
+                AI-proposed repair · needs your approval
+              </p>
+              <p className="text-[12.5px] leading-snug text-zinc-300">{proposal.summary}</p>
+              <p className="mt-0.5 text-[12px] leading-snug text-zinc-500">
+                Recorded as fixed only if it is in the catalog, the issue is gone on re-check and nothing else broke. Undo restores the state before it.
+              </p>
+            </div>
+          )}
+
+          {!g.actionable && !proposal && state.phase !== 'error' && g.manualHint && (
             <p className="mt-2 border-l border-white/[0.08] pl-3 text-[12.5px] leading-snug text-zinc-400">
               {g.manualHint}
             </p>
@@ -798,7 +852,12 @@ function ApprovalRow({
               {/* The fix button exists only when a fix does. `fixableCount` is
                   computed from the executor's own action mapping, so this can
                   never promise a repair the engine does not have. */}
-              {g.actionable && (
+              {proposal && (
+                <PrimaryAction onClick={() => onApproveProposal(proposal)} busy={state.phase === 'applying'} busyLabel="Applying…">
+                  Approve & fix
+                </PrimaryAction>
+              )}
+              {!proposal && g.actionable && (
                 <PrimaryAction
                   onClick={onApprove}
                   busy={state.phase === 'applying'}

@@ -193,8 +193,9 @@ describe('the billing contract is wired at every boundary', () => {
     expect(route).toContain('enforceAiCredits')
     // Charge half — the half that was missing, and whose absence made the gate
     // decorative. If a refactor drops this, the tool silently becomes free and
-    // unlimited again.
-    expect(route).toContain('chargeAiCredits')
+    // unlimited again. The route closes the turn, which charges and then stops
+    // the turn's credit holds counting.
+    expect(route).toContain('closeCreditTurn')
     // Charged from measured usage, not an estimate or a flat per-call fee.
     expect(route).toContain('runInTokenScope')
     expect(route).toContain('tokenScope.tokens')
@@ -204,8 +205,18 @@ describe('the billing contract is wired at every boundary', () => {
     // Guards hole #1 against regression.
     const route = read('app/api/mcp/chat/route.ts')
     expect(route).toContain('enforceAiCredits')
-    expect(route).toContain('chargeAiCredits')
+    expect(route).toContain('closeCreditTurn')
     expect(route).toContain('onTokens')
+  })
+
+  it('closing a turn charges it before it stops the turn’s holds counting', () => {
+    // Both routes charge through closeCreditTurn. If it stopped charging, every
+    // model-backed path would be free again; if it released before charging,
+    // a finished call would be counted nowhere for a moment.
+    const holds = read('lib/entitlements/credit-holds.ts')
+    const body = holds.slice(holds.indexOf('export async function closeCreditTurn('))
+    expect(body.indexOf('await chargeAiCredits(')).toBeGreaterThan(-1)
+    expect(body.indexOf('await chargeAiCredits(')).toBeLessThan(body.indexOf('aiCreditHold'))
   })
 
   it('names a non-empty model-backed set (guards against a vacuous pass)', () => {

@@ -36,7 +36,7 @@ import { anthropicProvider, bedrockProvider } from './providers/anthropic'
 import { openaiProvider } from './providers/openai'
 import { defaultPayer, reserveSpend, settleSpend } from './spend'
 import type { GenerateRequest, GenerateResult, LlmProvider, NormalizedUsage, ProviderId, PurposeRoute } from './types'
-import { costOf, effectiveTokensOf, maxCostOf, normalizeUsage } from './usage'
+import { costOf, effectiveTokensOf, maxCostOf, maxEffectiveTokensOf, normalizeUsage } from './usage'
 
 export type { AiPurpose, GenerateRequest, GenerateResult, NormalizedUsage, ProviderId } from './types'
 export { AiError } from './errors'
@@ -54,6 +54,15 @@ let retryDelayMs = (attempt: number) => 500 * 2 ** (attempt - 1)
 /** Route every call to `provider` (a scripted one in tests). `null` restores configuration. */
 export function setProviderForTests(provider: LlmProvider | null): void {
   override = provider
+}
+
+/**
+ * The provider calls go to right now: a test's, or the configured one. The
+ * lab's live arm wraps it to count calls. Throws not_configured when there is
+ * none.
+ */
+export function activeProvider(): LlmProvider {
+  return currentProvider()
 }
 
 /**
@@ -111,7 +120,8 @@ function finish(
     .join('')
 
   let json: unknown
-  if (req.jsonSchema) {
+  // A step that asks for tools carries no answer yet; the JSON is the final one.
+  if (req.jsonSchema && message.stop_reason !== 'tool_use') {
     const cutOff = message.stop_reason === 'max_tokens'
     try {
       if (cutOff) throw new Error('cut off')
@@ -153,6 +163,7 @@ export async function generate(req: GenerateRequest): Promise<GenerateResult> {
     model: route.model,
     payer: req.payer ?? defaultPayer(req.purpose),
     amountUsd: maxCostOf(route.model, params),
+    maxTokens: maxEffectiveTokensOf(route.model, params),
     expiresInMs: route.timeoutMs * MAX_ATTEMPTS + SETTLE_GRACE_MS,
     billingAccountId: req.billing?.billingAccountId,
     projectId: req.billing?.projectId,

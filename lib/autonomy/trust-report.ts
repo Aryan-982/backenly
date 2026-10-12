@@ -29,6 +29,7 @@ import { classifyFix } from '@/lib/core/fix-classifier'
 import { revertEligibility } from '@/lib/core/auto-fix-engine'
 import { INVARIANTS } from './desired-state'
 import { resolveExecutionMode, type ExecutionModeState } from './execution-mode'
+import { describeProposal } from './ai-proposals'
 
 export interface TrustScoreboard {
   windowDays: number
@@ -121,6 +122,12 @@ export interface PendingApproval {
    * differed by a table name but not whether they shared a cause.
    */
   details: Record<string, unknown>
+  /**
+   * An AI-proposed repair waiting for a person's approval of this exact
+   * version (lib/autonomy/ai-proposals.ts). Present only while it is pending
+   * and unexpired; the queue offers "Approve & fix" only when it is.
+   */
+  proposal?: { id: string; version: string; summary: string; expiresAt: string }
 }
 
 /**
@@ -547,6 +554,18 @@ export async function buildTrustReport(
     })
   }
 
+  // The live AI proposals for these rows. A table that does not exist yet (a
+  // deployment before the migration) reads as none.
+  const proposals = pending.length
+    ? await prisma.aiFixProposal.findMany({
+        where: { projectId, status: 'pending', expiresAt: { gt: new Date() }, findingId: { in: pending.map(p => p.id) } },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, findingId: true, action: true, params: true, proposalVersion: true, expiresAt: true },
+      }).catch(() => [] as Array<{ id: string; findingId: string; action: string; params: unknown; proposalVersion: string; expiresAt: Date }>)
+    : []
+  const proposalByFinding = new Map<string, (typeof proposals)[number]>()
+  for (const pr of proposals) if (!proposalByFinding.has(pr.findingId)) proposalByFinding.set(pr.findingId, pr)
+
   const pendingApprovals: PendingApproval[] = pending.map(p => {
     const det = (p.details ?? {}) as Record<string, any>
     return {
@@ -564,6 +583,19 @@ export async function buildTrustReport(
       source: det.source ?? 'autonomy',
       resource: det.location ?? det.tableName ?? undefined,
       details: det,
+      ...(proposalByFinding.has(p.id)
+        ? (() => {
+            const pr = proposalByFinding.get(p.id)!
+            return {
+              proposal: {
+                id: pr.id,
+                version: pr.proposalVersion,
+                summary: describeProposal(pr.action, (pr.params ?? {}) as Record<string, unknown>),
+                expiresAt: pr.expiresAt.toISOString(),
+              },
+            }
+          })()
+        : {}),
     }
   })
 
