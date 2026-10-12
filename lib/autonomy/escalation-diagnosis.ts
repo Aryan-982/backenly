@@ -31,12 +31,14 @@
  * intelligence is an API call, not a device.
  */
 
-import crypto from 'crypto'
 import { prisma } from '@/lib/db/prisma'
 import { AiError } from '@/lib/ai/llm'
 import { summariseFinding } from '@/lib/core/finding-summaries'
+import { classifyFix } from '@/lib/core/fix-classifier'
 import { resolveWorkspaceSchema } from '@/lib/services/workspace-pool'
 import { investigateFinding, type CatalogTable, type Investigation } from './investigator'
+import { evidenceFingerprint } from './finding-fingerprint'
+import { proposeRepair } from './ai-proposals'
 
 const MAX_PER_TICK = 2
 /** Model investigations per project per 24h. Deterministic ones are not counted. */
@@ -70,17 +72,7 @@ interface InvestigationState {
   history?: Array<{ at: string; verdict: string; rootCause: string }>
 }
 
-/**
- * The evidence a finding carries, as one hash: the detector's output without
- * this module's own fields. A diagnosis is kept while it matches.
- */
-export function evidenceFingerprint(type: string, details: Record<string, unknown>): string {
-  const evidence = { ...details }
-  delete evidence.diagnosis
-  delete evidence.investigation
-  const stable = JSON.stringify(evidence, Object.keys(evidence).sort())
-  return crypto.createHash('sha256').update(`${type}\n${stable}`).digest('hex').slice(0, 32)
-}
+export { evidenceFingerprint }
 
 /** Whether a finding should be investigated on this tick. */
 export function isDue(details: Record<string, unknown>, fingerprint: string, now = Date.now()): boolean {
@@ -109,7 +101,12 @@ async function loadCatalog(projectId: string): Promise<CatalogTable[]> {
 }
 
 /** The diagnosis stored for a model investigation: a hypothesis, labelled as one. */
-function hypothesisDiagnosis(investigation: Investigation, fingerprint: string, at: string) {
+function hypothesisDiagnosis(
+  investigation: Investigation,
+  fingerprint: string,
+  at: string,
+  proposal: Awaited<ReturnType<typeof proposeRepair>> | null,
+) {
   return {
     rootCause: investigation.rootCause.slice(0, 800),
     recommendation: investigation.recommendation.slice(0, 800),
@@ -125,6 +122,9 @@ function hypothesisDiagnosis(investigation: Investigation, fingerprint: string, 
     evidence: investigation.evidence,
     proposedAction: investigation.proposedAction,
     validation: investigation.validation,
+    // An approvable proposal, or the reason the suggestion stays advisory.
+    ...(proposal && 'proposalId' in proposal ? { proposal: { id: proposal.proposalId, version: proposal.proposalVersion } } : {}),
+    ...(proposal && 'reason' in proposal ? { proposalRefused: proposal.reason } : {}),
     fingerprint,
     at,
   }
@@ -137,18 +137,26 @@ function hypothesisDiagnosis(investigation: Investigation, fingerprint: string, 
 export async function diagnoseEscalatedFindings(projectId: string): Promise<number> {
   let written = 0
   try {
-    // Escalated = waiting on a human, or critical with nothing auto-fixable.
-    const candidates = await prisma.healthFinding.findMany({
+    // Escalated = waiting on a human, critical with nothing auto-fixable, or
+    // open with no repair the rules will run on their own (notify-only or
+    // approval-only): the cases the deterministic loop leaves to a person.
+    const rows = await prisma.healthFinding.findMany({
       where: {
         projectId,
         OR: [
           { status: 'pending_approval' },
-          { status: 'open', severity: 'critical' },
+          { status: 'open', severity: { in: ['critical', 'warning'] } },
         ],
       },
       orderBy: { detectedAt: 'desc' },
-      take: 10,
+      take: 20,
     })
+    const candidates = rows.filter(
+      (f) =>
+        f.status === 'pending_approval' ||
+        f.severity === 'critical' ||
+        classifyFix(f.type, (f.details ?? {}) as Record<string, unknown>).decision !== 'auto',
+    )
     const due = candidates
       .map((f) => {
         const details = (f.details ?? {}) as Record<string, unknown>
@@ -275,6 +283,23 @@ export async function diagnoseEscalatedFindings(projectId: string): Promise<numb
           continue
         }
 
+        // A suggested repair becomes an approvable proposal only when it is
+        // explained by checked evidence and passes every proposal condition.
+        // Nothing runs it here: only a person's approval does.
+        let proposal: Awaited<ReturnType<typeof proposeRepair>> | null = null
+        if (investigation.proposedAction) {
+          proposal = investigation.verdict === 'explained' && investigation.validation.ok
+            ? await proposeRepair({
+                projectId,
+                findingId: finding.id,
+                action: investigation.proposedAction.action,
+                paramsJson: investigation.proposedAction.paramsJson,
+                model: investigation.model,
+                rationale: investigation.rootCause,
+              }).catch((err) => ({ ok: false as const, reason: `it could not be recorded: ${err instanceof Error ? err.message : String(err)}` }))
+            : { ok: false as const, reason: 'the investigation did not explain the finding with checked evidence' }
+        }
+
         const at = new Date().toISOString()
         const done: InvestigationState = {
           fingerprint,
@@ -289,7 +314,7 @@ export async function diagnoseEscalatedFindings(projectId: string): Promise<numb
           data: {
             details: {
               ...details,
-              diagnosis: hypothesisDiagnosis(investigation, fingerprint, at),
+              diagnosis: hypothesisDiagnosis(investigation, fingerprint, at, proposal),
               investigation: done,
             } as any,
           },

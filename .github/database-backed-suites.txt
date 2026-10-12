@@ -607,6 +607,12 @@ tests/integration/runtime-generate.spec.ts
 # project's catalog, so it needs a real Postgres.
 tests/integration/escalation-investigation.spec.ts
 
+# The first AI repair class end to end: a lab fault, a bound proposal, a person's
+# approval of that exact version, governed execution checked three ways, Undo,
+# and the stale, double-approval, ineligible and resolve_finding guards. It
+# alters a workspace table and restores it, so it needs a real Postgres.
+tests/integration/ai-fix-proposals.spec.ts
+
 # Every meter measures what lib/usage/axes.ts says: streamed egress bytes once and
 # never for internal traffic, MAU once per user per month, database size including
 # branch schemas, file size from metadata, and function runs that executed.
