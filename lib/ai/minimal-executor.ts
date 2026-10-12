@@ -159,6 +159,14 @@ export interface ExecutionResult {
   /** ISO timestamp set when a live DB read-back confirmed the artifact exists */
   verifiedAt?: string
   /**
+   * The mutation completed, but its postcondition could not be read back.
+   * This deliberately remains separate from `success`: a failed observer does
+   * not establish that the database operation failed.
+   */
+  verification?: 'unverified'
+  /** Stable, non-sensitive reason for an unavailable postcondition readback. */
+  verificationError?: 'POSTCONDITION_READBACK_FAILED'
+  /**
    * Machine-readable failure code, forwarded to the agent by `dispatchTool` and
    * the MCP tool route so a caller can branch without regexing prose.
    *
@@ -3048,7 +3056,14 @@ async function verifyExecution(
     }
   } catch (error: any) {
     console.warn(`[Verify] Verification failed:`, error.message)
-    // Don't fail the whole operation due to verification issues
+    // Do not fail or replay a mutation just because its observer failed: the
+    // database operation may already have committed. Surface the uncertainty to
+    // the caller without forwarding a raw database/connection error.
+    result = {
+      ...result,
+      verification: 'unverified',
+      verificationError: 'POSTCONDITION_READBACK_FAILED',
+    }
   }
 
   return result
