@@ -66,6 +66,7 @@ import type { FixLoopResult } from '../agentic-fix-loop'
 import { recordToolExecutionMemory, type BackendEventStatus } from '@/lib/operational-memory/ledger'
 import { needsApproval } from '@/lib/mcp/domains'
 import { redactArgs } from './redact'
+import { currentPageContext, isAgentDoor, type BrainDoor } from './input-context'
 
 /**
  * One tool call the approval gate stopped, carried verbatim so the caller can
@@ -123,6 +124,8 @@ export interface BrainInput {
    * cleanly across writers (route handler, brain terminal paths, retries).
    */
   requestId?: string | null
+  /** The caller that opened this turn. Unlike `surface`, this is not page context. */
+  door?: BrainDoor
   /**
    * The product section the user is looking at while making a request.
    * E.g. "Database", "Auth & Users",
@@ -547,7 +550,7 @@ export async function runBrain(
     userMessage: input.message,
     understandingBlock,
     // A coding agent over MCP: the protected-production gate applies.
-    agentSurface: input.surface === 'mcp',
+    agentSurface: isAgentDoor(input.door),
     createdThisTurn: new Set<string>(),
     onToolEvent: (e) => {
       if (e.phase === 'start') emit({ type: 'tool_start', tool: e.tool, title: e.title })
@@ -1233,9 +1236,7 @@ async function runAgentLoop(
     (rolledSummary ? `EARLIER CONTEXT:\n${rolledSummary}\n\n` : '') +
     `INTENT CLASSIFICATION (advisory): ${classification.intent} (${classification.confidence.toFixed(2)}) — ${classification.reasoning}\n` +
     `${intentHint}\n` +
-    (input.surface
-      ? `USER'S CURRENT PAGE: ${input.surface} — deictic references ("this table", "this page", "why is this failing") likely point at what that section shows. Use it to resolve ambiguity; never refuse because a name was omitted when the page implies it.\n`
-      : '')
+    currentPageContext(input.surface)
   const messages = conversationFor(recent, input.message)
 
   let mutated = false
