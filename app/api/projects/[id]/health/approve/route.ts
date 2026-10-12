@@ -86,6 +86,31 @@ export const POST = withProjectAccess(async (req: NextRequest, { user, project, 
     },
   })
 
+  // Diagnosis precision receipt: when this finding carried an autonomous
+  // diagnosis (escalation-diagnosis.ts), approving its fix is the "accepted"
+  // outcome. The "rejected" side is recorded on dismissal (POST /health).
+  const diagnosis = ((finding.details ?? {}) as Record<string, unknown>).diagnosis as
+    | { confidence?: string; model?: string }
+    | undefined
+  if (diagnosis) {
+    prisma.auditLog.create({
+      data: {
+        projectId,
+        action: 'AUTONOMY_DIAGNOSIS_OUTCOME',
+        type: 'autonomy',
+        details: JSON.stringify({
+          findingId,
+          findingType: finding.type,
+          outcome: 'accepted',
+          confidence: diagnosis.confidence ?? null,
+          model: diagnosis.model ?? null,
+          at: new Date().toISOString(),
+        }),
+        timestamp: new Date(),
+      },
+    }).catch(() => {})
+  }
+
   // Execute the fix (bypasses the classification gate — user already approved)
   const result = await executeApprovedFix(findingId, projectId)
 
@@ -157,6 +182,8 @@ export const POST = withProjectAccess(async (req: NextRequest, { user, project, 
         statements: (result.rollbackData as Record<string, unknown> | undefined)?.statements ?? [],
         // Drives the ledger copy: only 'confirmed' may claim re-verification.
         verification: result.verification ?? 'unverified',
+        // Only 'ran' may claim nothing else broke.
+        regressionCheck: result.regressionCheck ?? 'unavailable',
       }),
       timestamp: new Date(),
     },
