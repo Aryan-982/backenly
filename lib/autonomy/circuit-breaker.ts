@@ -123,7 +123,9 @@ function windowMinutes(): number {
 export const AUTONOMOUS_AUDIT_ACTIONS = [
   'HEALTH_AUTO_FIXED',          // auto-fix-engine._executeAutoFix
   'FIX_PLAN_AUTO_EXECUTED',     // auto-fix-engine.runFixPlan
-  'AGENT_AUTO_FIXED',           // agent-orchestrator.executeAutoFixes
+  // The retired agent orchestrator. No longer written; kept so its historic
+  // rows still appear in feeds, where they read as applied but not verified.
+  'AGENT_AUTO_FIXED',
 ] as const
 
 /**
