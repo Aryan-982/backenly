@@ -52,6 +52,13 @@ jest.mock('@/lib/mcp/approvals', () => {
   }
 })
 
+// The project's billing account, which the route gates and charges credits on.
+// Read from the database in the route; a fixed one here, as this suite has none.
+jest.mock('@/lib/usage/account', () => ({
+  ...jest.requireActual('@/lib/usage/account'),
+  creditAccountOf: async () => 'account-1',
+}))
+
 jest.mock('@/lib/entitlements/policy', () => ({
   enforceAiCredits: jest.fn(async () =>
     mockCreditsExhausted
@@ -320,6 +327,9 @@ describe('the tool route', () => {
     expect(res.status).toBe(402)
     expect(body.code).toBe('AI_CREDITS_EXHAUSTED')
     expect(mockDispatched).toEqual([])
+    // Gated on the project's billing account, not on the caller.
+    const { enforceAiCredits } = jest.requireMock('@/lib/entitlements/policy')
+    expect(enforceAiCredits).toHaveBeenLastCalledWith('account-1')
   })
 
   it('keeps a readiness read side-effect free through the deploy tool too', async () => {
@@ -351,6 +361,13 @@ describe('runApprovedCall', () => {
     const out = await runApprovedCall('delete_bucket', { bucketName: 'x' }, ctx, async () => ({ ok: false, summary: 'no such bucket' }))
     expect(out).toMatchObject({ status: 'failed' })
     expect(out.summary).toMatch(/no such bucket/)
+  })
+
+  it('never claims a failed call changed nothing, since a multi-step call can stop part-way', async () => {
+    const out = await runApprovedCall('trigger_deploy', {}, ctx, async () => ({ ok: false, summary: 'migration step failed' }))
+    expect(out.status).toBe('failed')
+    expect(out.summary).not.toMatch(/nothing was applied|unchanged/i)
+    expect(out.summary).toMatch(/read the current state/)
   })
 
   it('reports a thrown or overrunning call as failed rather than hanging', async () => {
