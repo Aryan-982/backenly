@@ -5,19 +5,20 @@
  *
  * Replaced the drawn, clickable dashboard (components/landing/HeroConsole,
  * deleted 2026-09-26, last present at f997755) on an explicit product
- * decision. Since v4 the film is the narrated launch film, 77 seconds of one
- * chain: an MCP key is pasted into Claude Code, the agent builds an online
- * store's backend through Backenly, it is published and takes orders, the
- * console's sections are shown one by one, and at 03:12 with nobody online
- * Backenly fixes what is safe and holds a riskier change for approval.
+ * decision. Since v4 the film is the narrated launch film; since v5 it is
+ * that film without its title and closing cards, 63 seconds of one chain: an
+ * MCP key is pasted into Claude Code, the agent builds an online store's
+ * backend through Backenly, it is published and takes orders, the console's
+ * sections are shown one by one, and at 03:12 with nobody online Backenly
+ * fixes what is safe and holds a riskier change for approval.
  *
  * THE STALENESS TRADE, taken knowingly. AutonomyFilm and the console were both
  * drawn rather than filmed because a recording of our own dashboard shipped on
  * this page once and was pulled when the product moved underneath it. That
  * risk is real here too. The contract that manages it:
  *
- *   - The film is versioned in its file names (`-v4`). A re-render ships under
- *     a NEW name (`-v5`), never over the old one: next.config.js serves
+ *   - The film is versioned in its file names (`-v5`). A re-render ships under
+ *     a NEW name (`-v6`), never over the old one: next.config.js serves
  *     /media/* as immutable, so a file replaced in place would stay stale in
  *     every browser that has already cached it for up to a year.
  *   - Re-render when anything the film shows changes shape: the shell's top
@@ -26,37 +27,54 @@
  *     the Overview's self-healing loop and review queue.
  *   - After a re-render, re-pick OPEN_AT and the poster frame (below).
  *
- * Files, all cut from the one 1920x1080 60fps master (H.264 + AAC, 69.6 MB):
+ * NO TITLE OR CLOSING CARD. The launch film opens on a title card (the
+ * logo, the wordmark and "The autonomous backend platform, built for your
+ * coding agents") and closes on two more ("Your coding agent builds it.
+ * Backenly keeps it running." and the wordmark with a try-it-free button).
+ * Here they only repeated the headline right above the film and the page's
+ * own call to action, so v5 is cut down to the product: launch-film seconds
+ * 6.10 to 69.55. Both cuts fall in pauses in the narration, after its
+ * opening line ends (6.05) and before its closing one begins (69.70), so no
+ * word is clipped, and both fall where the cards are fully out of frame (the
+ * title has left by 5.9; the closing line appears at 70.0). The film fades up
+ * from black over its first 0.35s and back to black over its last 0.6s, so
+ * the loop still passes through black rather than cutting hard from the
+ * closing shot to the opening one.
  *
- *   hero-film-v4.1.mp4        desktop, H.264 High 5.1 CRF 28 (veryslow) + AAC
- *                             128k, 60fps, moov atom at the front, ~10.5 MB.
- *   hero-film-v4.1-1280.mp4   phones: H.264 High 4.0, 1280x720, 30fps, CRF 28
+ * Files:
+ *
+ *   hero-film-v5.mp4          desktop, H.264 High 5.1 CRF 24 (veryslow) + AAC
+ *                             128k, 60fps, moov atom at the front, ~10.2 MB.
+ *   hero-film-v5-1280.mp4     phones: H.264 High 4.0, 1280x720, 30fps, CRF 26
  *                             + AAC 96k, ~5.2 MB. Every phone decodes H.264
  *                             in hardware.
- *   hero-film-v4-poster.webp  the frame at OPEN_AT, ~49 KB
+ *   hero-film-v5-poster.webp  the frame at OPEN_AT, ~48 KB
  *
- * COLOUR IS TAGGED. The cuts were encoded the way ffmpeg encodes by default:
- * RGB to YUV through the BT.601 matrix, with no colour description in the
- * stream. An untagged HD stream leaves the matrix to each browser's guess,
- * and the guesses differ: Chromium decodes it as BT.601, which is right,
- * while players that assume BT.709 for HD (Safari among them) turn the
+ * The master (1920x1080 60fps, H.264 + AAC, 69.6 MB) is not in this
+ * repository, so v5 was cut from v4.1, the shipped CRF 28 desktop cut: one
+ * more generation, paid for with a lower CRF (SSIM 0.998 against v4.1).
+ * Recutting from the master at the same times would save that generation.
+ *
+ * COLOUR IS TAGGED. The launch film was encoded the way ffmpeg encodes by
+ * default: RGB to YUV through the BT.601 matrix, with no colour description
+ * in the stream. An untagged HD stream leaves the matrix to each browser's
+ * guess, and the guesses differ: Chromium decodes it as BT.601, which is
+ * right, while players that assume BT.709 for HD (Safari among them) turn the
  * violet greyer and the magenta dusty, and the film no longer matches its own
- * poster. v4.1 is v4 with the description written in, byte for byte the same
- * picture (`-c copy` through `h264_metadata`, plus an MP4 `colr` box):
- * primaries and transfer BT.709, matrix BT.601 (smpte170m), limited range.
- * A re-render should encode with explicit tags (`-colorspace`,
- * `-color_primaries`, `-color_trc`) so this never needs doing again; check
- * with ffprobe that `color_space` is not `unknown`.
+ * poster. v4.1 wrote the description into v4 without re-encoding; v5 is
+ * encoded with it: primaries and transfer BT.709, matrix BT.601 (smpte170m),
+ * limited range, in the stream and in an MP4 `colr` box. Any re-render must
+ * keep explicit tags (`-colorspace`, `-color_primaries`, `-color_trc`,
+ * `-color_range`); check with ffprobe that `color_space` is not `unknown`.
  *
  * The master's backdrop carries a fine animated grain (it keeps the violet
  * gradient from banding), and grain is what the bitrate pays for here. It is
  * kept rather than denoised: denoising would change the approved look and
- * bring the banding back. At CRF 28, text and the gradient look the same as
- * the master at 100%.
+ * bring the banding back.
  *
  * No WebM this time, on measurement. v3 led with a VP9 cut because it was a
  * quarter lighter at the same picture. On this film it is not: VP9 two-pass
- * CRF 42 came out at 11.4 MB against the MP4's 10.5 MB, and was worse on
+ * CRF 42 came out at 11.4 MB against v4's 10.5 MB MP4, and was worse on
  * the camera moves (SSIM against the master, every frame: mean 0.990 with
  * 387 frames under 0.97, against the MP4's 0.994 with none). Every current
  * browser plays H.264 + AAC; one that cannot rests on the poster.
@@ -70,12 +88,11 @@
  * string, and one that claims a level the file exceeds skips a source it could
  * have played, or picks one it cannot.
  *
- * OPENS ON THE TITLE, NOT ON BLACK. The master fades up from black and fades
- * back to black (so it loops without a seam), and a poster taken from frame 0
- * would greet every visitor with an empty box. The poster is the settled
- * title card (wordmark, line, and the console in frame) just before the
- * camera pushes into Connect, and the first play seeks there, so there is no
- * jump from poster to picture: they are the same frame.
+ * OPENS ON THE COMMAND, NOT ON BLACK. The film fades up from black, and a
+ * poster taken from frame 0 would greet every visitor with an empty box. The
+ * poster is the Connect page once the camera has settled on it, with the one
+ * command an agent needs in frame, and the first play seeks there, so there
+ * is no jump from poster to picture: they are the same frame.
  *
  * SOUND IS OPT-IN. The film is narrated, and it always starts muted: browsers
  * refuse an unmuted autoplay anyway, and a page that talks before it is asked
@@ -84,12 +101,12 @@
  * argument and arriving mid-sentence wastes it; muting and unmuting again
  * later carries on where it is. With sound on the film plays through once
  * rather than looping, so the narration never starts over by itself, and at
- * the end it goes back to the silent loop from the title card instead of
- * resting on the closing black frame.
+ * the end it goes back to the silent loop from the opening command instead
+ * of resting on the closing black frame.
  *
- * Reduced motion gets the title card as a still and never autoplays; either
- * button plays it on request. Playback also stops while the frame is off
- * screen, sound or not, and a visitor's own pause is never overridden by
+ * Reduced motion gets the opening command as a still and never autoplays;
+ * either button plays it on request. Playback also stops while the frame is
+ * off screen, sound or not, and a visitor's own pause is never overridden by
  * scrolling back.
  *
  * Hydration: nothing here renders differently on the client's first pass.
@@ -104,7 +121,7 @@ import { Pause, Play, Volume2, VolumeX } from 'lucide-react'
 import { useSettledReducedMotion } from '@/lib/hooks/useSettledReducedMotion'
 
 const FILM = {
-  poster: '/media/hero-film-v4-poster.webp',
+  poster: '/media/hero-film-v5-poster.webp',
   width: 1920,
   height: 1080,
 } as const
@@ -117,19 +134,20 @@ const FILM = {
  */
 const SOURCES = [
   {
-    src: '/media/hero-film-v4.1-1280.mp4',
+    src: '/media/hero-film-v5-1280.mp4',
     type: 'video/mp4; codecs="avc1.640028, mp4a.40.2"',
     media: '(max-width: 767px)',
   },
-  { src: '/media/hero-film-v4.1.mp4', type: 'video/mp4; codecs="avc1.640033, mp4a.40.2"' },
+  { src: '/media/hero-film-v5.mp4', type: 'video/mp4; codecs="avc1.640033, mp4a.40.2"' },
 ] as const satisfies readonly { src: string; type: string; media?: string }[]
 
 /**
- * Seconds into the film where the title card has settled and before the
- * camera starts its push into Connect (4.4s to 5.08s in v4). Measured by
- * frame difference, not by eye. The poster is the frame at this time.
+ * Seconds into the film where the camera has settled on the Connect page
+ * (from 0.75s in v5) and before the cursor copies the command. Measured by
+ * frame difference, not by eye, and on both cuts' frame grids (frame 48 at
+ * 60fps, 24 at 30fps). The poster is the frame at this time.
  */
-const OPEN_AT = 4.95
+const OPEN_AT = 0.8
 
 /**
  * NO FRAME. The film is already staged: a violet backdrop with the console
@@ -163,7 +181,7 @@ const FEATHER_SIZE = '[--fx:7%] [--fb:16%] md:[--fx:9%] md:[--fb:26%]'
  * Each frame is drawn into a 32x18 canvas lying exactly under the video,
  * and a CSS blur spreads it out past the film's edges. Aligned, every colour
  * glows out from where it sits in the picture; a canvas scaled up past the
- * film instead shifted its light (the wordmark's showed as a smudge above
+ * film instead shifted its light (a bright title showed as a smudge above
  * the film). The blur runs on the compositor over a tiny canvas, and the
  * canvas is redrawn at most 30 times a second and never while the film is
  * paused. Each new frame is mixed into the last rather than replacing it,
@@ -221,7 +239,10 @@ function useAmbientLight(
     let last = -Infinity
 
     function onFrame(now: number) {
-      if (now - last >= AMBIENT_INTERVAL_MS && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      if (
+        now - last >= AMBIENT_INTERVAL_MS &&
+        video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+      ) {
         last = now
         paint(video, AMBIENT_BLEND)
       }
@@ -360,7 +381,7 @@ export function HeroFilm() {
     video.currentTime = OPEN_AT
     setSound(false)
     // The effect restarts the loop unless motion is reduced, in which case
-    // the film rests on the title card it opened on.
+    // the film rests on the command it opened on.
     setIntent('auto')
   }
 
@@ -454,23 +475,21 @@ export function HeroFilm() {
       {/* The same story for anyone who cannot see or hear it: what is on
           screen, then the narration word for word. */}
       <figcaption className="sr-only">
-        A 77-second narrated film of Backenly. On screen, an MCP key is created
+        A 63-second narrated film of Backenly. On screen, an MCP key is created
         in Backenly and pasted into Claude Code, which builds the backend for
         UrbanCart, an online store, and publishes it. Orders arrive, and the
         console shows its Database, Auth, Storage, Realtime and Monitoring
         pages. At 3:12 AM a request slows down; Backenly adds a missing index
         on its own, while a foreign-key fix waits until a person approves it.
-        The narration: Introducing Backenly. The autonomous backend platform,
-        built for your coding agents. Copy one command. Paste it into your
-        coding agent, and it’s connected. Ask for the backend you need. It
-        builds through Backenly, and every change is verified. Publish it. And
-        it’s live. Then the first orders come in. Each one lands in your
-        database. With Auth, every customer signs in. Product photos load from
-        Storage. Realtime streams every order. And Monitoring sees every
-        request. And when something breaks while you’re away, Backenly finds
-        it, fixes what’s safe, and proves the fix worked. Anything risky waits
-        for you. Fixed, verified, and reversible. Your coding agent builds it.
-        Backenly keeps it running. Try it for free.
+        The narration: Copy one command. Paste it into your coding agent, and
+        it’s connected. Ask for the backend you need. It builds through
+        Backenly, and every change is verified. Publish it. And it’s live. Then
+        the first orders come in. Each one lands in your database. With Auth,
+        every customer signs in. Product photos load from Storage. Realtime
+        streams every order. And Monitoring sees every request. And when
+        something breaks while you’re away, Backenly finds it, fixes what’s
+        safe, and proves the fix worked. Anything risky waits for you. Fixed,
+        verified, and reversible.
       </figcaption>
     </figure>
   )
