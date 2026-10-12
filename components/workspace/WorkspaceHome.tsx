@@ -81,9 +81,8 @@ import { FOCUS, FOCUS_INSET } from '@/components/console/tokens'
 import {
   levelLabel, useAutonomyStatus, type AutonomyLastAction,
 } from '@/lib/hooks/useAutonomyStatus'
-// Type only — the block itself no longer renders here (see the note in the
-// body); /health still returns findings and the loop counts them.
-import { type AdvisorFinding } from '@/components/workspace/AdvisorBlock'
+import { type GroupableFinding } from '@/lib/core/finding-groups'
+import { freshlyVerifiedRepairs, quietState as quietStateFor, type SensorSummary } from '@/components/workspace/health-state'
 import { ObservabilityStrip } from '@/components/workspace/ObservabilityStrip'
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -98,6 +97,16 @@ interface BuildStatus {
   summary: { statusLabel: string; verdict?: Verdict }
 }
 
+/** One finding row as /health returns it. */
+interface AdvisorFinding extends GroupableFinding {
+  id: string
+  type: string
+  severity: 'critical' | 'warning' | 'info' | string
+  details: Record<string, any> | null
+  status: string // 'open' | 'pending_approval' | 'auto_fixed' | 'fixed' | 'dismissed'
+  detectedAt: string | null
+}
+
 interface HealthData {
   /** Last DEEP observer sweep — daily cron. NOT the self-healing cadence. */
   lastCheckedAt: string | null
@@ -108,7 +117,10 @@ interface HealthData {
    * bug this field exists to fix (see lib/autonomy/loop-tick.ts).
    */
   lastReconciledAt: string | null
+  /** Repairs a re-check confirmed in the last 7 days. */
   autoFixedThisWeek: number
+  /** Repairs that ran but could not be confirmed — never shown as fixes. */
+  unverifiedRepairsThisWeek?: number
   /** Uncapped count of findings held for approval. */
   needsAttention: number
   criticalCount?: number
@@ -117,6 +129,15 @@ interface HealthData {
   actionableTotal?: number
   /** TRUNCATED preview (see FINDINGS_PREVIEW_LIMIT) — render it, never count it. */
   findings?: AdvisorFinding[]
+  /**
+   * How findings that recently left the queue left it (lib/autonomy/resolution).
+   * The only basis this page has for showing a repair.
+   */
+  recentlyResolved?: Array<{ id: string; type: string; severity: string; closedBy: string; at: string }>
+  /** What the loop's last pass could check (lib/autonomy/sensor-state). */
+  sensors?: SensorSummary | null
+  /** When this page received the payload (client clock, set on fetch). */
+  fetchedAt?: number
 }
 
 interface DashboardStats {
@@ -188,10 +209,16 @@ export function WorkspaceHome({
   const [stats, setStats]       = useState<DashboardStats | null>(null)
   const { status: autonomy, refresh: refreshAutonomy } = useAutonomyStatus(hasBackend ? projectId : null)
 
-  // Heal choreography signal: bumped when a previously-open finding closes on
-  // its own, so the loop instrument can animate the fix flowing through. It is
-  // a real state transition made legible — never a timer-driven fiction.
+  // Whether the last /health read failed. Without it a failed load looked like
+  // "nothing is wrong", and the headline below would have said all clear.
+  const [healthError, setHealthError] = useState(false)
+
+  // Heal choreography signal: bumped when the server reports a repair that a
+  // re-check CONFIRMED (recentlyResolved, closedBy 'autonomy_verified'). A
+  // finding merely leaving the list is not a repair: it may have been
+  // dismissed, withdrawn or escalated, and none of those may animate a fix.
   const [healSignal, setHealSignal] = useState(0)
+  const seenResolvedRef = useRef<Set<string> | null>(null)
   const prevOpenIdsRef = useRef<Set<string> | null>(null)
 
   // no-store: this dashboard live-polls while a finding is open, so a cached
@@ -211,7 +238,9 @@ export function WorkspaceHome({
     const get = (route: string) =>
       fetch(`/api/projects/${projectId}/${route}`, noStore).then(r => r.ok ? r.json() : null).catch(() => null)
     get('build-status').then(v => { if (v) setBuild(v) })
-    get('health').then(v => { if (v?.data) setHealth(v.data) })
+    get('health').then(v => {
+      if (v?.data) { setHealth({ ...v.data, fetchedAt: Date.now() }); setHealthError(false) } else setHealthError(true)
+    })
     get('dashboard-stats').then(v => { if (v?.data) setStats(v.data) })
   }, [projectId, hasBackend]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -223,8 +252,9 @@ export function WorkspaceHome({
     if (!projectId || !hasBackend) return
     try {
       const res = await fetch(`/api/projects/${projectId}/health`, noStore)
-      if (res.ok) { const j = await res.json(); if (j?.data) setHealth(j.data) }
-    } catch { /* soft-fail — next poll retries */ }
+      const j = res.ok ? await res.json() : null
+      if (j?.data) { setHealth({ ...j.data, fetchedAt: Date.now() }); setHealthError(false) } else setHealthError(true)
+    } catch { setHealthError(true) /* the next poll retries */ }
   }, [projectId, hasBackend]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { loadAll() }, [loadAll])
@@ -252,24 +282,39 @@ export function WorkspaceHome({
     return () => clearInterval(iv)
   }, [projectId, hasBackend, hasOpenFinding, refreshHealth, refreshAutonomy])
 
-  // Detect a self-heal: a finding that was open is no longer open. Fire the
-  // loop signal, pull a fresh scoreboard so Apply/Verify tick in step, and do
-  // one full refresh so the verdict-driven headline settles to "all clear".
+  // A verified self-heal: the server reports a repair a re-check confirmed that
+  // this page has not shown yet. Only that animates the loop. Anything already
+  // in the first payload is history, not news, so it never animates.
+  useEffect(() => {
+    const resolved = health?.recentlyResolved
+    if (!resolved) return
+    const seen = seenResolvedRef.current
+    if (seen == null) {
+      seenResolvedRef.current = new Set(resolved.map(r => r.id))
+      return
+    }
+    const freshlyVerified = freshlyVerifiedRepairs(resolved, seen)
+    for (const r of resolved) seen.add(r.id)
+    if (freshlyVerified.length > 0 && autonomy?.level !== 'OFF') {
+      setHealSignal(n => n + 1)
+      refreshAutonomy()
+      loadAll() // verdict/headline/stats catch up to the repaired state
+    }
+  }, [health, autonomy?.level, refreshAutonomy, loadAll])
+
+  // Any finding leaving the open set (repaired, dismissed, withdrawn or
+  // escalated) refreshes the counts and headline, without claiming a repair.
   useEffect(() => {
     const openIds = new Set(
       (health?.findings ?? []).filter(f => f.status === 'open').map(f => f.id),
     )
     const prev = prevOpenIdsRef.current
     prevOpenIdsRef.current = openIds
-    if (prev == null) return // first load — establish baseline, never fire
-    let closed = false
-    for (const id of prev) if (!openIds.has(id)) { closed = true; break }
-    if (closed && autonomy?.level !== 'OFF') {
-      setHealSignal(n => n + 1)
-      refreshAutonomy()
-      loadAll() // verdict/headline/stats catch up to the healed reality
+    if (prev == null) return
+    for (const id of prev) {
+      if (!openIds.has(id)) { refreshAutonomy(); loadAll(); break }
     }
-  }, [health, autonomy?.level, refreshAutonomy, loadAll])
+  }, [health, refreshAutonomy, loadAll])
 
   if (!hasBackend) return null
 
@@ -332,6 +377,21 @@ export function WorkspaceHome({
 
   const hasOpenWork = (openFindings ?? 0) > 0 || liveFailed > 0 || liveBlocked > 0
 
+  // ── The quiet state: nothing open. Say only what was actually checked ────
+  //
+  // This used to read "All clear. … Schema, APIs, auth and storage are healthy"
+  // whenever nothing was open, including when /health had failed to load, when
+  // the loop had not run and when checks had errored. See health-state.ts.
+  const quietState = quietStateFor({
+    health,
+    healthError,
+    autonomyOff: autonomy?.level === 'OFF',
+    // Freshness is judged as of when the payload arrived. A later failed
+    // refresh sets healthError, so an old payload is never vouched for.
+    now: health?.fetchedAt ?? 0,
+    formatAgo: formatRelative,
+  })
+
   // ── Agent panel state — one headline, one action, in the agent's voice ───
   const autonomyPending = heldFindings ?? autonomy?.pendingCount ?? 0
   const agent: {
@@ -360,10 +420,7 @@ export function WorkspaceHome({
       body: 'Your backend is ready. Point your coding agent at it and Backenly starts watching every change live: schema, APIs, auth, storage.',
       cta: { label: 'Connect your agent', onClick: () => router.push(`/app/projects/${projectId}/connect`) },
     }
-    : {
-      headline: 'All clear. Self-healing on watch',
-      body: 'Schema, APIs, auth and storage are healthy. Backenly re-checks continuously and repairs safe issues on its own. Only auth or destructive changes ever wait for you.',
-    }
+    : quietState
 
   // ── Loop phase (derived from real state, never animated fiction) ─────────
   const autonomyOff = autonomy?.level === 'OFF'
