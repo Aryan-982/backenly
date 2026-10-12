@@ -111,7 +111,8 @@ function finish(
     .join('')
 
   let json: unknown
-  if (req.jsonSchema) {
+  // A step that asks for tools carries no answer yet; the JSON is the final one.
+  if (req.jsonSchema && message.stop_reason !== 'tool_use') {
     const cutOff = message.stop_reason === 'max_tokens'
     try {
       if (cutOff) throw new Error('cut off')

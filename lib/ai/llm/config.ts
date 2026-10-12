@@ -39,9 +39,6 @@ const ROUTES: Record<AiPurpose, Omit<PurposeRoute, 'model'>> = {
   'functions.generate':   { thinking: true,  effort: 'high',   maxTokens: 16000, timeoutMs: 180_000 },
   // Explanations a person reads: impact, guidance, simulations, the assistant.
   'insight.explain':      { thinking: false, effort: 'medium', maxTokens: 4096,  timeoutMs: 90_000 },
-  // A short written diagnosis of an escalated finding, after the deterministic
-  // investigation could not conclude. The investigator proper is autonomy.investigate.
-  'autonomy.diagnose':    { thinking: false, effort: 'medium', maxTokens: 4096,  timeoutMs: 90_000 },
   'autonomy.investigate': { thinking: true,  effort: 'max',    maxTokens: 32000, timeoutMs: 300_000 },
   // The public /v1/{projectId}/ai/generate endpoint: `default` and `fast`.
   'runtime.generate':     { thinking: false, effort: 'medium', maxTokens: 4096,  timeoutMs: 60_000 },
@@ -110,7 +107,6 @@ function openaiDefault(purpose: AiPurpose, env: Env): string {
       return set(env.OPENAI_MODEL_FAST) ?? 'gpt-4o-mini'
     case 'build.fix_author':
       return set(env.AUTONOMY_FIX_MODEL) ?? 'gpt-4o'
-    case 'autonomy.diagnose':
     case 'autonomy.investigate':
       return set(env.AUTONOMY_DIAGNOSIS_MODEL) ?? 'gpt-4o'
     default:
