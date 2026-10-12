@@ -459,10 +459,33 @@ async function observeProject(projectId: string, result: ObserverResult): Promis
     } else if (finding.autoFixable && finding.fix) {
       try {
         await finding.fix()
-        status = 'auto_fixed'
-        autoFixed = true
-        fixAppliedAt = new Date()
-        result.autoFixed++
+        // The repair returning is not proof it worked. Re-check the specific
+        // gap against the live database, the same rule every other repair path
+        // follows: 'resolved' is a verified fix, 'unresolved' is not a fix at
+        // all, and anything else is a repair that ran without confirmation.
+        const { recheckGap } = await import('@/lib/autonomy/desired-state')
+        const recheck = await recheckGap(
+          projectId,
+          finding.type,
+          finding.details as Record<string, unknown>,
+        ).catch(() => 'unknown' as const)
+        if (recheck === 'unresolved') {
+          status = 'pending_approval'
+          result.pendingApproval++
+          finding.details = {
+            ...finding.details,
+            fixError: 'The repair ran, but the problem is still present on re-check.',
+          }
+        } else {
+          status = 'auto_fixed'
+          autoFixed = true
+          fixAppliedAt = new Date()
+          result.autoFixed++
+          finding.details = {
+            ...finding.details,
+            verification: recheck === 'resolved' ? 'confirmed' : 'unverified',
+          }
+        }
       } catch (err: any) {
         // Fix failed — demote to pending_approval so a human can review
         status = 'pending_approval'
@@ -733,12 +756,12 @@ async function observeProject(projectId: string, result: ObserverResult): Promis
   try {
     const { reapStaleFindings } = await import('@/lib/core/finding-reaper')
     const reaped = await reapStaleFindings(projectId)
-    const total = reaped.arch + reaped.performance + reaped.invariants + reaped.migration
+    const total = reaped.arch + reaped.retired + reaped.invariants + reaped.drift
     if (total > 0) {
       console.log(
         `[WorkspaceObserver] reaped stale findings for ${projectId}: ` +
-        `arch=${reaped.arch} performance=${reaped.performance} ` +
-        `invariants=${reaped.invariants} migration=${reaped.migration}`,
+        `arch=${reaped.arch} retired=${reaped.retired} ` +
+        `invariants=${reaped.invariants} drift=${reaped.drift}`,
       )
     }
   } catch { /* best-effort — a failed reap must never fail the scan */ }
@@ -876,11 +899,15 @@ async function writeFinding(
   // "previous fix", so it escalated itself on the next scan). The approve
   // route writes the real user-resolution history when the user acts.
   if (status === 'auto_fixed') {
-    const resolution = buildResolutionText(
+    const text = buildResolutionText(
       finding.type as FindingType,
       finding.details as Record<string, unknown>,
       true,
     )
+    // History is kept for every repair that ran (recurrence escalation reads
+    // it), but only a re-checked repair may call itself fixed.
+    const verified = (finding.details as Record<string, unknown>).verification === 'confirmed'
+    const resolution = verified ? text : text.replace(/^Auto-fixed:/, 'Applied, not verified:')
     await writeFixHistory(projectId, {
       findingType: finding.type as FindingType,
       findingSeverity: finding.severity as FindingSeverity,

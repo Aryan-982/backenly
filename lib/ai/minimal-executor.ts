@@ -1514,7 +1514,7 @@ AUTH:
 - LIST_USERS - List the project's end-users (people who signed up via the project's auth)
 - BLOCK_USER - Block an end-user from signing in
 - UNBLOCK_USER - Unblock a previously blocked end-user
-- RESET_PASSWORD - Reset an end-user's password (returns a temporary password to share out-of-band)
+- RESET_PASSWORD - Email an end-user a single-use password reset link (never returns a password)
 
 Built-in auth endpoints (always available — no action needed, already live):
   POST /v1/{projectId}/auth/signup            — register end-user
@@ -3318,10 +3318,12 @@ async function executeSingleAction(
       console.error('[ApprovalGate] Failed to queue pending action finding:', error)
     }
 
-    const verb = riskLevel === 'high' ? 'delete' : 'confirm'
+    // No message approves this: the owner approves the queued finding in
+    // Autonomy, which runs exactly these params. Suggesting a phrase to type
+    // would tell an agent, or the person reading it, something untrue.
     return {
       success: false,
-      message: `⛔ \`${action.action}\`${target ? ` on \`${target}\`` : ''} requires confirmation (${riskLevel} risk). Type \`confirm ${verb} ${target ?? 'this'}\` to proceed now, or review it under Autonomy.`,
+      message: `⛔ \`${action.action}\`${target ? ` on \`${target}\`` : ''} was not run: it is a ${riskLevel}-risk action and is waiting for the project owner's approval in the Review Queue (Autonomy). Approving it there runs exactly this action.`,
       error: 'APPROVAL_REQUIRED',
     }
   }
@@ -7510,64 +7512,85 @@ async function executeBlockUser(params: any, projectId: string): Promise<Executi
 }
 
 /**
- * AUTH: Reset Password
- * Generates a secure temporary password, hashes it, and updates the workspace user.
- * Returns the temp password to the admin so they can share it out-of-band.
+ * AUTH: Reset Password — emails the end user a single-use reset link.
+ *
+ * Starts the same flow as the app's own "forgot password"
+ * (lib/services/end-user-auth-flows.ts): the person who owns the account gets
+ * the link, the password changes only when THEY use it, and no credential is
+ * ever returned to the caller. A password is something only its owner should
+ * ever hold, so no tool sets one on their behalf.
  */
 async function executeResetPassword(params: any, projectId: string): Promise<ExecutionResult> {
   const { userId, email } = params
   if (!userId && !email) return { success: false, message: 'userId or email is required' }
 
   try {
-    const { prisma } = await import('@/lib/db')
-    const crypto = await import('crypto')
-    const { hashPassword } = await import('@/lib/auth/password')
     const schemaName = `workspace_${projectId}`
 
-    // Detect which column actually stores the password hash. Standard projects
-    // use "password" (signup DDL); AI-generated schemas sometimes use
-    // "password_hash". The signin route already detects this — match its
-    // behaviour so reset works on either layout instead of failing silently
-    // ("UPDATE 0 rows") when the column doesn't exist.
-    const pwColRows = await prisma.$queryRawUnsafe<{ column_name: string }[]>(
-      `SELECT column_name FROM information_schema.columns
-       WHERE table_schema = $1 AND table_name = 'users'
-         AND column_name IN ('password', 'password_hash') LIMIT 1`,
-      schemaName,
-    )
-    const pwCol = pwColRows[0]?.column_name ?? 'password'
-
-    // Verify user exists
+    // Resolve the account's email address, which is where the link goes.
+    // Service-role read: FORCE row-level security hides end-user rows from a
+    // claimless query under the production role, which would report a real
+    // account as missing.
+    const { executeWithUserContext } = await import('@/lib/services/workspace-rls')
     const identifier = email ? 'email' : 'id'
-    const paramValue = email || userId
-    const users = await prisma.$queryRawUnsafe<any[]>(
+    const paramValue = String(email || userId)
+    const users = await executeWithUserContext<{ id: string; email: string | null }>(
+      '',
+      true,
       `SELECT id, email FROM "${schemaName}"."users" WHERE "${identifier}" = $1 LIMIT 1`,
-      paramValue
+      [identifier === 'email' ? paramValue.toLowerCase().trim() : paramValue],
     )
-
-    if (!users[0]) {
+    const target = users[0]
+    if (!target) {
       return { success: false, message: `User "${paramValue}" not found in this project` }
     }
+    if (!target.email) {
+      return {
+        success: false,
+        message: `User "${paramValue}" has no email address, so a reset link cannot be sent. No password was changed.`,
+      }
+    }
 
-    const targetUser = users[0]
-
-    // Generate a secure random temp password (16 chars)
-    const tempPassword = crypto.randomBytes(8).toString('hex')
-    const hashed = await hashPassword(tempPassword)
-
-    await prisma.$executeRawUnsafe(
-      `UPDATE "${schemaName}"."users" SET "${pwCol}" = $1 WHERE id = $2`,
-      hashed,
-      targetUser.id
+    // The same per-recipient budget the public forgot-password route applies,
+    // so this door cannot be used to flood one person's inbox either.
+    const { consume, AUTH_LIMITS } = await import('@/lib/security/auth-rate-limit')
+    const recipient = target.email.trim().toLowerCase()
+    const limit = await consume(
+      `v1:endUserRecover:target:${projectId}:${recipient}`,
+      AUTH_LIMITS.endUserRecover.ip.limit,
+      AUTH_LIMITS.endUserRecover.ip.windowMs,
     )
+    if (!limit.allowed) {
+      // Two different refusals, and only one of them means a link already went out.
+      return {
+        success: false,
+        message:
+          limit.outcome === 'limit_exceeded'
+            ? `A reset link was sent to ${target.email} recently. Wait before sending another. No password was changed.`
+            : `Could not check the sending limit right now, so no reset link was sent. Try again shortly. No password was changed.`,
+      }
+    }
+
+    const { issueEndUserPasswordReset } = await import('@/lib/services/end-user-auth-flows')
+    const outcome = await issueEndUserPasswordReset(projectId, recipient)
+    if (!outcome.emailSent) {
+      return {
+        success: false,
+        message:
+          `Could not email a reset link to ${target.email}: email delivery is not configured for this ` +
+          `project (SMTP), or the send failed. No password was changed.`,
+      }
+    }
 
     return {
       success: true,
-      message: `✅ Password reset for **${targetUser.email}**\n\n**Temporary password** (share securely):\n\`\`\`\n${tempPassword}\n\`\`\`\n\nThe user must change this after signing in.`,
-      data: { userId: targetUser.id, email: targetUser.email, tempPassword },
+      message:
+        `✅ Sent a password reset link to **${target.email}**. It expires in 1 hour. ` +
+        `The password changes only when they use the link; nothing was changed now.`,
+      data: { userId: target.id, email: target.email, resetEmailSent: true },
     }
   } catch (error: any) {
-    return { success: false, message: `Failed to reset password: ${error.message}`, error: error.message }
+    return { success: false, message: `Failed to send a password reset: ${error.message}`, error: error.message }
   }
 }
 

@@ -325,6 +325,13 @@ __tests__/auth/user-delete-authorization.test.ts
 # identically against the bug.
 __tests__/services/fresh-install-auth-purge.test.ts
 
+# Every "fixed" claim comes from a recorded, re-checked outcome: /health says
+# how each finding closed and counts only confirmed repairs, POST /health only
+# dismisses, the away digest and event feed mark unconfirmed changes as such
+# and claim no rollback, and the loop's sensor record names checks that could
+# not run. Real findings, audit rows and preferences are the property.
+tests/integration/fixed-claims-from-verified-state.spec.ts
+
 # Five destructive routes that did not check who was asking. Three had NO
 # authentication at all - anyone reaching the server could roll back a live
 # deployment or rebuild a workspace database. Two verified a token and then
@@ -701,3 +708,14 @@ tests/integration/branch-auth.spec.ts
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.
 # Real provisioned projects (encrypted secrets) and real users are the property.
+
+# An approval runs only the exact call it recorded: a request with no stored
+# call is closed without running anything and says why, a closed request cannot
+# be approved again, and every new request stores its exact arguments. Real
+# approval rows and audit rows are the property, so it needs a real Postgres.
+tests/integration/approval-binding.spec.ts
+
+# Resetting an end user's password from an agent never changes the password and
+# never returns a credential; an unknown account is reported plainly. Real
+# workspace users tables are the property, so it needs a real Postgres.
+tests/integration/reset-password-sends-link.spec.ts
