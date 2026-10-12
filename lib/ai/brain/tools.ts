@@ -3189,10 +3189,25 @@ async function runExecutor(
     // the user. The model must NOT keep chaining tools after this — the next
     // user message ("CONNECT" / "DISCONNECT") is what proceeds.
     const requiresConfirmation = (result.data as any)?.requiresConfirmation === true
+    // Preserve the established success shape unless postcondition verification
+    // was unavailable. In that case expose a machine-readable uncertainty on
+    // the same data channel the MCP route already forwards.
+    const data = result.verification
+      ? {
+          ...(result.artifacts ?? {}),
+          ...(result.data && typeof result.data === 'object' && !Array.isArray(result.data)
+            ? result.data
+            : result.data === undefined
+              ? {}
+              : { result: result.data }),
+          verification: result.verification,
+          ...(result.verificationError ? { verificationError: result.verificationError } : {}),
+        }
+      : result.artifacts ?? result.data
     return {
       ok: true,
       summary: clip(result.message || 'Done.'),
-      data: result.artifacts ?? result.data,
+      data,
       ...(requiresConfirmation ? { terminal: true, needsUser: true } : {}),
     }
   }
