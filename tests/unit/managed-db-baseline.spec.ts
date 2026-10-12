@@ -110,6 +110,9 @@ const FORWARD_MIGRATIONS = [
   '20261004120000_request_log_branch',
   '20261004130000_branch_migrations',
   '20261006120000_billing_accounts',
+  '20261011120000_ai_spend_ledger',
+  '20261012120000_ai_fix_proposals',
+  '20261012130000_ai_credit_holds',
 ]
 
 describe('the assembled migration workspace', () => {

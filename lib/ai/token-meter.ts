@@ -35,13 +35,23 @@ import { AsyncLocalStorage } from 'async_hooks'
 export interface TokenScope {
   /** Total tokens (prompt + completion) observed inside this scope. */
   tokens: number
+  /**
+   * AI credit holds taken by calls inside this scope, closed together when the
+   * turn is charged (lib/entitlements/credit-holds.ts closeCreditTurn).
+   */
+  holds: string[]
 }
 
 const storage = new AsyncLocalStorage<TokenScope>()
 
 /** A fresh scope. Hold the reference — it stays readable after `runInTokenScope` throws. */
 export function createTokenScope(): TokenScope {
-  return { tokens: 0 }
+  return { tokens: 0, holds: [] }
+}
+
+/** The scope open on this async stack, if any. */
+export function activeTokenScope(): TokenScope | undefined {
+  return storage.getStore()
 }
 
 /**
