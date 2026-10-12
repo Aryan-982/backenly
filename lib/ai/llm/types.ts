@@ -20,7 +20,11 @@ export type AiPurpose =
   | 'brain.architect'
   | 'brain.agent'
   | 'build.fix_author'
+  | 'build.classify'
+  | 'build.plan'
   | 'functions.generate'
+  | 'insight.explain'
+  | 'autonomy.diagnose'
   | 'autonomy.investigate'
   | 'runtime.generate'
 
@@ -64,6 +68,12 @@ export interface GenerateRequest {
   /** Ask for JSON that matches this schema (`output_config.format`). */
   jsonSchema?: Record<string, unknown>
   signal?: AbortSignal
+  /**
+   * Receives the answer's text as it is written, for a reply shown while it
+   * streams. Claude providers stream it; the OpenAI adapter delivers the whole
+   * text once, at the end. The full result is still returned.
+   */
+  onText?: (delta: string) => void
   /**
    * Who pays. Defaults by purpose: `autonomy.*` is the deployment's own spend,
    * everything else a customer's (lib/ai/llm/spend.ts).
@@ -109,6 +119,8 @@ export interface SendOptions {
   signal?: AbortSignal
   /** Stream and collect the final message. Used for long outputs and thinking, where a single response risks an HTTP timeout. */
   stream: boolean
+  /** Receives the answer's text as it is written, where the provider streams it. */
+  onText?: (delta: string) => void
 }
 
 /** One provider. Throws its own errors; the gateway classifies them. */

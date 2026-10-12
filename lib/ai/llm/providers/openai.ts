@@ -162,13 +162,19 @@ export function fromOpenAI(completion: OpenAI.Chat.ChatCompletion): Anthropic.Me
 export function openaiProvider(apiKey: string, client: Pick<OpenAI, 'chat'> = new OpenAI({ apiKey, maxRetries: 0 })): LlmProvider {
   return {
     id: 'openai',
-    async send(params, { timeoutMs, signal }) {
+    async send(params, { timeoutMs, signal, onText }) {
       const completion = await client.chat.completions.create(toOpenAI(params), {
         timeout: timeoutMs,
         maxRetries: 0,
         ...(signal ? { signal } : {}),
       })
-      return fromOpenAI(completion)
+      const message = fromOpenAI(completion)
+      // Not streamed here: the whole text arrives once, when it is complete.
+      if (onText) {
+        const text = message.content.filter((b): b is Anthropic.TextBlock => b.type === 'text').map((b) => b.text).join('')
+        if (text) onText(text)
+      }
+      return message
     },
   }
 }

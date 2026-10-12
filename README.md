@@ -201,8 +201,12 @@ It does not hide the steps or replace them: it runs the same sequence
 bringing your own database, if a step failed and you want to run it yourself,
 or if you would simply rather see what is being done to your machine.
 
-The installer needs one thing the README cannot give you: an `OPENAI_API_KEY`
-in `.env` for planning and the autonomy loop. Everything else it generates.
+The installer generates everything except one choice: which AI provider
+serves the natural-language tools (`backend_chat`, function generation). Set
+`ANTHROPIC_API_KEY` or `OPENAI_API_KEY` in `.env`, or `AI_PROVIDER=bedrock`
+with `BEDROCK_REGION` to use Claude through your AWS account. Without one,
+those tools say AI is unavailable; the typed tools and the self-healing loop
+need no model.
 
 <a name="doing-it-by-hand"></a>
 
@@ -260,7 +264,7 @@ BACKENLY_PROJECT_ID=<uuid>       # any UUID, e.g. `uuidgen`
 JWT_SECRET=<openssl rand -hex 32>
 POSTGREST_JWT_SECRET=<openssl rand -hex 32>
 STORAGE_SECRET=<openssl rand -hex 32>
-OPENAI_API_KEY=<your key>
+ANTHROPIC_API_KEY=<your key>    # or OPENAI_API_KEY, or AI_PROVIDER=bedrock + BEDROCK_REGION
 ```
 
 `BACKENLY_EDITION` is already `single-tenant` in the template and you can leave
@@ -284,7 +288,8 @@ short-lived internal tokens with it. `STORAGE_SECRET` signs the access tokens fo
 stored files — without it every upload fails with a 500 whose only explanation is
 in the server log. None of the three has a default, deliberately: a fallback
 baked into a public repository is a key everybody already knows.
-`OPENAI_API_KEY` powers planning and the autonomy loop. See
+The AI provider key powers the natural-language tools; `.env.example` lists the
+providers, per-purpose model overrides and monthly AI spending limits. See
 [`.env.example`](.env.example) for the rest.
 
 #### 2. Tell the database which role Backenly connects as
@@ -580,7 +585,7 @@ coding agents working in this repo as much as for people.
 
 Self-hosting is free and complete. This repository is the whole platform:
 runtime, governance, and the full self-healing engine, not a stripped community
-edition. You bring the servers, the Postgres, and the OpenAI key.
+edition. You bring the servers, the Postgres, and an AI provider key.
 
 [Backenly Cloud](https://backenly.com/pricing) runs the same codebase, and
 handles infrastructure, backups, upgrades, and the autonomy tokens. `pg_dump`

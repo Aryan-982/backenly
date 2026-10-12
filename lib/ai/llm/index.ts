@@ -146,7 +146,7 @@ export async function generate(req: GenerateRequest): Promise<GenerateResult> {
   // A scripted provider stands in for Claude, so it is routed as Claude.
   const route = routeFor(req.purpose, provider.id === 'scripted' ? 'anthropic' : provider.id)
   const params = buildParams(route, req)
-  const stream = shouldStream(route, params.max_tokens)
+  const stream = shouldStream(route, params.max_tokens) || !!req.onText
 
   const reservation = await reserveSpend({
     purpose: req.purpose,
@@ -161,7 +161,7 @@ export async function generate(req: GenerateRequest): Promise<GenerateResult> {
   for (let attempt = 1; ; attempt++) {
     let message: Anthropic.Message
     try {
-      message = await provider.send(params, { timeoutMs: route.timeoutMs, signal: req.signal, stream })
+      message = await provider.send(params, { timeoutMs: route.timeoutMs, signal: req.signal, stream, onText: req.onText })
     } catch (err) {
       const e = classifyProviderError(err, provider.id)
       e.attempts = attempt

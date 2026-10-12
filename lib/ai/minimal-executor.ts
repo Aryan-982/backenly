@@ -7,7 +7,6 @@
  * No complexity. No architecture. Just: AI → Backend.
  */
 
-import { getOpenAIClient } from './openai-service'
 import { isReservedWorkspaceTable } from '@/lib/security/workspace-schema'
 import { getActiveGraph, saveNewGraph } from '@/lib/orchestration/graph-pointer'
 import { withTimeout } from './with-timeout'
@@ -18,6 +17,7 @@ import { USER_ROLE_ID_BASES as _SEMANTIC_USER_ROLE_ID_BASES, USER_SEMANTIC_COLS 
 import { writeDecisionEntry, extractFkInferences } from '@/lib/memory/decision-memory'
 import { riskLevelForExecutorAction, queuePendingActionFinding } from '@/lib/operational-memory/ledger'
 import { plaintextForStorage } from '@/lib/auth/api-key-plaintext'
+import { chat } from '@/lib/ai/llm/chat'
 
 export interface AIAction {
   /** Optional trace explaining why this action was chosen — aids debugging hallucinations */
@@ -1409,8 +1409,6 @@ export async function extractAction(
   // SYSTEM 1: Live Schema Injection
   const liveSchema = await introspectSchema(projectId)
   
-  const openai = getOpenAIClient()
-  
   // Check if this is an INSERT_DATA request - if so, get schema first
   const isInsertRequest = /insert|add.*data|mock.*data|sample.*data|test.*data/i.test(userMessage)
   let schemaContext = ''
@@ -1911,18 +1909,18 @@ Error: ${previousError}
     console.log('[Replanning] Retrying with error context:', previousError.substring(0, 100))
   }
 
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4.1',
+  const response = await chat({
+    purpose: 'build.plan',
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: enhancedUserMessage },
     ],
-    temperature: 0.1,
-    max_tokens: 500,
-    response_format: { type: 'json_object' },
+    maxTokens: 500,
+    json: true,
+    label: 'action-extractor',
   })
 
-  const extracted = JSON.parse(response.choices[0].message.content || '{"action":"UNKNOWN"}')
+  const extracted = JSON.parse(response.text || '{"action":"UNKNOWN"}')
   
   console.log('[AI Executor] Extracted action:', extracted)
   
