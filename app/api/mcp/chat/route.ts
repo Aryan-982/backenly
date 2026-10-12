@@ -164,10 +164,9 @@ export async function POST(request: NextRequest) {
           userId: auth.userId,
           message: parsed.message,
           sessionToken: undefined,
-          destructiveConfirmed: false,
-          // Headless surface: there is no interactive human to type a
-          // confirmation, so a destructive request must escalate to the Review
-          // Queue rather than dead-end on a conversational "reply to confirm".
+          // Headless surface: a call that needs approval is stopped by the
+          // brain's gate and queued for the Review Queue below, never confirmed
+          // by message.
           surface: 'mcp',
           // ── Verification is budgeted, not hoped for ─────────────────────────
           //
@@ -192,45 +191,48 @@ export async function POST(request: NextRequest) {
     spentTokens = Math.max(spentTokens, result.tokensUsed)
     chargeOnce()
 
-    // Escalation instead of a dead end. Two ways a destructive request surfaces:
-    //   1. `danger` event — the brain actually attempted the destructive tool
-    //      and hit the gate. Precise target/rowCount/reversible.
-    //   2. No danger event, but the turn was classified DESTRUCTIVE and ended
-    //      asking the user to confirm. Over MCP that ask can never be answered
-    //      (destructiveConfirmed is always false here), so we escalate it too,
-    //      with best-effort details parsed from the request.
-    // Either way the human decides in the dashboard; approval replays the
-    // ORIGINAL message with destructiveConfirmed=true, which does execute it.
+    // Escalation instead of a dead end. Every call the brain's approval gate
+    // stopped is queued for a human with its EXACT tool and arguments, one
+    // request per call, and approval runs that call verbatim, so the operation
+    // on the card is the operation that runs. A turn that only talked about a
+    // destructive change, without attempting a call, queues nothing: there is
+    // no exact operation to approve.
     let approval: { id: string; status: string; poll: string; note: string } | null = null
-    const danger = events.find((e) => e.type === 'danger') as
-      | Extract<BrainEvent, { type: 'danger' }>
-      | undefined
-    const conversationalDestructive =
-      !danger && result.classification.intent === 'DESTRUCTIVE' && result.needsUser
-
-    if (danger || conversationalDestructive) {
-      const dangerInfo = danger
-        ? { tool: danger.tool, target: danger.target, rowCount: danger.rowCount, reversible: danger.reversible }
-        : inferDestructive(parsed.message)
+    const queued: Array<{ id: string; tool: string; target: string }> = []
+    for (const blocked of result.blockedCalls ?? []) {
       try {
-        const req2 = await createApprovalRequest({
+        const row = await createApprovalRequest({
           projectId: auth.projectId,
           userId: auth.userId,
           apiKeyId: auth.keyId,
           message: parsed.message,
-          danger: dangerInfo,
+          danger: {
+            tool: blocked.tool,
+            target: blocked.target,
+            rowCount: blocked.rowCount,
+            reversible: blocked.reversible,
+          },
+          toolArgs: blocked.args,
         })
-        approval = {
-          id: req2.id,
-          status: 'pending',
-          poll: `check_approval with { "id": "${req2.id}" }`,
-          note:
-            `This operation is destructive and needs human approval. It is now waiting in the ` +
-            `project's Review Queue. Tell your human to approve or reject it in the Backenly ` +
-            `dashboard, then poll check_approval until status is executed, rejected, or expired (24h).`,
-        }
+        queued.push({ id: row.id, tool: blocked.tool, target: blocked.target })
       } catch (e) {
         console.error('[MCP Chat] Failed to create approval request:', e)
+      }
+    }
+    if (queued.length > 0) {
+      const first = queued[0]
+      approval = {
+        id: first.id,
+        status: 'pending',
+        poll: `check_approval with { "id": "${first.id}" }`,
+        note:
+          `This operation needs human approval and was not run. It is waiting in the project's ` +
+          `Review Queue exactly as requested. Tell your human to approve or reject it in the Backenly ` +
+          `dashboard, then poll check_approval until status is executed, rejected, or expired (24h).` +
+          (queued.length > 1
+            ? ` ${queued.length - 1} more operation(s) from this turn are queued separately: ` +
+              queued.slice(1).map((q) => `${q.tool} on ${q.target} (id "${q.id}")`).join('; ') + '.'
+            : ''),
       }
     }
 
@@ -253,8 +255,8 @@ export async function POST(request: NextRequest) {
     // human". Say that, and give the agent the id to poll.
     const escalated = approval !== null
     const summary = escalated
-      ? `${result.summary}\n\n⏸ This operation is destructive, so Backenly did not run it. ` +
-        `It is waiting for human approval in the project's Review Queue (Autonomy page). ` +
+      ? `${result.summary}\n\n⏸ This operation needs a human's approval, so Backenly did not run it. ` +
+        `It is waiting, exactly as requested, in the project's Review Queue (Autonomy page). ` +
         `Poll \`check_approval\` with id "${approval!.id}" until the status is executed, rejected or expired. ` +
         `Nothing has changed yet.`
       : result.summary
@@ -281,6 +283,8 @@ export async function POST(request: NextRequest) {
       summary,
       needsUser: result.needsUser,
       approval,
+      /** Every operation queued this turn; `approval` is the first of them. */
+      ...(queued.length > 1 ? { approvals: queued } : {}),
       iterations: result.iterations,
       toolsRun: result.toolsRun,
       // ── The failure classification, at the TOP LEVEL ─────────────────────────
@@ -435,63 +439,6 @@ export async function POST(request: NextRequest) {
       { status },
     ))
   }
-}
-
-/**
- * Best-effort danger details when the brain asked for confirmation
- * conversationally instead of tripping the tool gate. Cosmetic — the Review
- * Queue shows tool/target; the stored ORIGINAL message is what actually
- * replays on approval, so precision here isn't load-bearing.
- */
-function inferDestructive(message: string): { tool: string; target: string; rowCount: number | null; reversible: boolean } {
-  const m = message.toLowerCase()
-  const nameMatch = message.match(/\b([a-z_][a-z0-9_]*)\b(?=\s+(?:table|bucket|column|file))|(?:table|bucket|column|file)\s+["'`]?([a-z_][a-z0-9_]*)/i)
-  const target = (nameMatch?.[1] || nameMatch?.[2] || 'the requested resource').trim()
-
-  // Covers every member of brain/tools#DESTRUCTIVE_TOOLS a user can phrase in
-  // prose, not just the schema ones. It previously guessed `drop_table` for
-  // anything it did not recognise, so a request to disconnect an integration
-  // was queued as "drop the requested resource table" — a Review Queue entry
-  // that describes an operation nobody asked for is worse than a vague one,
-  // because the human approves it on the strength of the description.
-  let tool = 'drop_table'
-  if (/truncate|wipe|empty|clear all/.test(m)) tool = 'truncate_table'
-  else if (/disconnect|remove|delete/.test(m) && /integration|stripe|resend|sendgrid|openai|anthropic|posthog|twilio|api key for/.test(m)) tool = 'remove_integration_key'
-  else if (/revoke/.test(m) && /key/.test(m)) tool = 'revoke_api_key'
-  else if (/rotate/.test(m) && /key/.test(m)) tool = 'rotate_api_key'
-  else if (/(delete|remove)/.test(m) && /function/.test(m)) tool = 'delete_ai_function'
-  else if (/(delete|remove)/.test(m) && /trigger/.test(m)) tool = 'delete_trigger'
-  else if (/(delete|remove)/.test(m) && /(cron|scheduled job)/.test(m)) tool = 'delete_cron_job'
-  else if (/(delete|remove|unset)/.test(m) && /(env|environment variable|secret)/.test(m)) tool = 'delete_env_var'
-  else if (/(disable|turn off)/.test(m) && /realtime/.test(m)) tool = 'disable_realtime'
-  else if (/(deploy|publish|ship|go live)/.test(m)) tool = 'trigger_deploy'
-  else if (/roll ?back/.test(m)) tool = 'rollback_deploy'
-  else if (/block/.test(m) && /user/.test(m)) tool = 'block_end_user'
-  else if (/column/.test(m)) tool = 'drop_column'
-  else if (/bucket/.test(m)) tool = 'delete_bucket'
-  else if (/\bfile\b/.test(m)) tool = 'delete_file'
-
-  const providerMatch = m.match(/\b(stripe|resend|sendgrid|openai|anthropic|posthog|twilio)\b/)
-  const label =
-    tool === 'drop_column' ? `column ${target}` :
-    tool === 'delete_bucket' ? `${target} bucket` :
-    tool === 'delete_file' ? `file ${target}` :
-    tool === 'remove_integration_key' ? `the ${providerMatch?.[1] ?? target} integration` :
-    tool === 'revoke_api_key' || tool === 'rotate_api_key' ? 'an API key' :
-    tool === 'delete_ai_function' ? `function ${target}` :
-    tool === 'delete_trigger' ? `trigger ${target}` :
-    tool === 'delete_cron_job' ? `cron job ${target}` :
-    tool === 'delete_env_var' ? `environment variable ${target}` :
-    tool === 'disable_realtime' ? `realtime on ${target}` :
-    tool === 'trigger_deploy' ? 'production' :
-    tool === 'rollback_deploy' ? 'the live deployment' :
-    tool === 'block_end_user' ? `end-user ${target}` :
-    `${target} table`
-
-  // Recreatable vs. genuinely lost. Credentials are NOT reversible — Backenly
-  // holds only the encrypted value and cannot re-derive it once removed.
-  const REVERSIBLE = new Set(['drop_table', 'drop_column', 'disable_realtime', 'block_end_user', 'rollback_deploy'])
-  return { tool, target: label, rowCount: null, reversible: REVERSIBLE.has(tool) }
 }
 
 function condense(e: BrainEvent): Partial<BrainEvent> & { type: string } {
