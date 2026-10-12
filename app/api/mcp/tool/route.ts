@@ -394,12 +394,14 @@ export async function POST(request: NextRequest) {
     }
     const guidance: Record<string, string> = {
       pending: 'Still waiting for the human. Poll again in 15-30s, or remind them to open the Review Queue.',
+      approved: 'Approved and running now. Poll again in a few seconds for the outcome.',
       executed: 'Approved and executed — the resultSummary describes what changed. Verify with read tools if needed.',
-      // `failed` now means NOTHING was applied, which is what makes it safe to
-      // act on. A run that applied some of its plan and then stopped reports
-      // `partial` instead — treating that as `failed` and replaying is how a
-      // half-finished destructive plan gets double-applied.
-      failed: 'Approved but execution failed and NOTHING was applied — the backend is unchanged. Read resultSummary and report it to the human.',
+      // `failed` does not promise the backend is unchanged. Approval runs one
+      // exact call, and a deploy, merge or data migration can stop part-way
+      // without saying which steps took effect, so replaying blind can apply a
+      // half-finished change twice.
+      failed: 'Approved, but the call did not complete. resultSummary says what it reported. Check the current state with read tools before raising it again, because a call that stops part-way can leave some of its work applied.',
+      // Written only by the approval path this one replaced; older rows keep it.
       partial: 'Approved, and SOME changes were applied before the run stopped. Do NOT replay the original request. resultSummary lists exactly what landed; verify with get_table_schema / read_backend_state and ask only for what is still missing.',
       rejected: 'The human rejected this operation. Do not retry it; ask what they want instead.',
       expired: 'The request expired unapproved (24h). Ask the human whether to raise it again.',
@@ -782,12 +784,14 @@ export async function POST(request: NextRequest) {
       { status: 500 },
     ))
   } finally {
-    if (metered && tokenScope.tokens > 0) {
-      Promise.all([import('@/lib/entitlements/policy'), import('@/lib/usage/account')])
-        .then(async ([{ chargeAiCredits }, { creditAccountOf }]) => {
-          const account = await creditAccountOf(auth.projectId)
-          if (account) await chargeAiCredits(account, tokenScope.tokens)
-        })
+    // Charge a metered tool's tokens, then close its credit holds. A tool that
+    // is not metered still releases any hold a model call inside it took.
+    const charge = metered ? tokenScope.tokens : 0
+    if (charge > 0 || tokenScope.holds.length > 0) {
+      Promise.all([import('@/lib/entitlements/credit-holds'), import('@/lib/usage/account')])
+        .then(async ([{ closeCreditTurn }, { creditAccountOf }]) =>
+          closeCreditTurn(await creditAccountOf(auth.projectId), tokenScope, charge),
+        )
         .catch(() => {})
     }
   }
