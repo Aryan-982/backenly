@@ -613,6 +613,14 @@ tests/integration/escalation-investigation.spec.ts
 # alters a workspace table and restores it, so it needs a real Postgres.
 tests/integration/ai-fix-proposals.spec.ts
 
+# The lab's AI arm: each fault seeded, broken, filed by its canonical detector
+# and handed to the investigator (a scripted model), measured as gates (no
+# unapproved mutation, no false "fixed", no model call on a healthy backend
+# with nothing escalated)
+# separately from utility. It seeds and alters lab schemas, so it needs a real
+# Postgres.
+tests/integration/ai-lab-arm.spec.ts
+
 # Every meter measures what lib/usage/axes.ts says: streamed egress bytes once and
 # never for internal traffic, MAU once per user per month, database size including
 # branch schemas, file size from metadata, and function runs that executed.
