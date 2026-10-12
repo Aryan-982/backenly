@@ -187,8 +187,9 @@ export type ToolName =
 
 /**
  * Tools whose effect is data loss, breaks live consumers, or reverts production.
- * The agent loop refuses to call these without `destructiveConfirmed=true` on
- * the BrainInput (which is set from a "yes / confirm / drop / revoke" message).
+ * The agent loop never runs these itself: its gate (`needsApproval`, which also
+ * covers executors rated high-risk) stops the call and the caller queues it,
+ * exactly as issued, for a human to approve. No message can authorise one.
  * The executor also has its own approval-gate as defence-in-depth.
  */
 const DESTRUCTIVE_TOOLS = new Set<ToolName>([
@@ -942,7 +943,7 @@ export const BRAIN_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     'List open / pending health findings (issues the platform detected) for this project — id, type, severity, target table/column, reason. Use to map a problem (e.g. a pasted error screenshot or "fix this") to a concrete issue before resolve_finding. Side-effect free.',
     {}),
   fn('resolve_finding',
-    'Resolve a detected health finding through the governed fix engine. Pass findingId (from list_findings or the diagnostic context). If you only know the kind of problem, pass findingType and/or tableName/columnName and the closest match is resolved. Safe/additive fixes (FK, RLS, index, API) apply immediately and are verified; auth/destructive/irreversible fixes return a confirmation request — relay it to the user and only call again after they confirm.',
+    'Resolve a detected health finding through the governed fix engine. Pass findingId (from list_findings or the diagnostic context). If you only know the kind of problem, pass findingType and/or tableName/columnName and the closest match is resolved. Safe/additive fixes (FK, RLS, index, API) apply immediately and are verified. Auth/destructive/irreversible fixes are not applied here: the result says the fix needs a person\'s approval in the Review Queue (Autonomy page). Relay that, and do not call again for the same finding: no message can approve it.',
     {
       findingId: { type: 'string', description: 'Exact finding id (preferred — from list_findings or the diagnostic context).' },
       findingType: { type: 'string', description: 'e.g. missing_fk, missing_rls, integration_smtp_unreachable — used to match a finding when no id is known.' },
@@ -1208,7 +1209,7 @@ export const BRAIN_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 
   // ── Auth lifecycle ────────────────────────────────────────────────────────
   fn('reset_end_user_password',
-    'Reset an end-user\'s password. Generates a secure temporary password and returns it so the project owner can hand it to the user out-of-band — it does NOT email the user. Accepts either userId or email.',
+    'Send an end-user a single-use password reset link by email (expires in 1 hour). Their password changes only when they use the link; no password is ever returned. Fails truthfully when the project has no email delivery configured. Accepts either userId or email.',
     { userId: { type: 'string' }, email: { type: 'string' } }),
   fn('block_end_user',
     'DESTRUCTIVE. Block an end-user — their existing JWT tokens stop working immediately and they cannot sign in. Reversible via unblock_end_user. Requires confirmation.',
@@ -2867,8 +2868,8 @@ export async function dispatchTool(
         userId: ctx.userId,
       })
       // 'fixed' is success. needs_confirmation / notify / failed are surfaced as
-      // ok:false so the model relays the message (asks the user to confirm, or
-      // explains the manual step) rather than claiming it fixed something.
+      // ok:false so the model relays the message (where a person approves the
+      // fix, or the manual step) rather than claiming it fixed something.
       return finalize({
         ok: res.outcome === 'fixed',
         summary: clip(res.message),
@@ -2882,9 +2883,11 @@ export async function dispatchTool(
     if (name === 'get_pending_incidents') {
       const { prisma } = await import('@/lib/db/prisma')
       const { summariseFinding } = await import('@/lib/core/finding-summaries')
+      const { fixVerificationOf } = await import('@/lib/autonomy/resolution')
+      const { loadSensorState } = await import('@/lib/autonomy/sensor-state')
       const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000)
 
-      const [open, approvals, driftPending, autoFixed, snapshot] = await Promise.all([
+      const [open, approvals, driftPending, autoFixed, snapshot, sensors] = await Promise.all([
         prisma.healthFinding.findMany({
           where: { projectId: ctx.projectId, status: { in: ['open', 'pending_approval'] } },
           orderBy: { detectedAt: 'desc' },
@@ -2909,6 +2912,7 @@ export async function dispatchTool(
           orderBy: { versionNum: 'desc' },
           select: { versionNum: true, createdAt: true, tableCount: true },
         }).catch(() => null),
+        loadSensorState(ctx.projectId),
       ])
 
       const sevRank: Record<string, number> = { critical: 0, warning: 1, info: 2 }
@@ -2921,13 +2925,18 @@ export async function dispatchTool(
           status: f.status,
           detectedAt: f.detectedAt.toISOString(),
           summary: summariseFinding(f.type, f.details as Record<string, unknown>),
-          diagnosis: ((f.details ?? {}) as Record<string, unknown>).diagnosis,
+          diagnosis: withProvenance(((f.details ?? {}) as Record<string, unknown>).diagnosis),
         }))
-      const fixedRows = autoFixed.map((f) => ({
+      // A repair is "fixed" only when a re-check confirmed it. The rest ran
+      // without confirmation and are reported as exactly that.
+      const repairRows = autoFixed.map((f) => ({
         type: f.type,
         fixedAt: f.fixAppliedAt?.toISOString(),
+        verified: fixVerificationOf(f.details as Record<string, unknown>) === 'confirmed',
         summary: summariseFinding(f.type, f.details as Record<string, unknown>),
       }))
+      const fixedRows = repairRows.filter((r) => r.verified)
+      const unconfirmedRows = repairRows.filter((r) => !r.verified)
 
       // ── TWO queues wait on a human, and they are not the same queue ──────
       //
@@ -2948,7 +2957,8 @@ export async function dispatchTool(
         `${waitingTotal} waiting on you ` +
         `(${approvals.length} agent-requested operation${approvals.length === 1 ? '' : 's'} in the Review Queue, ` +
         `${escalatedFindings.length} autonomy fix${escalatedFindings.length === 1 ? '' : 'es'} escalated), ` +
-        `${fixedRows.length} auto-fixed in the last 24h, ` +
+        `${fixedRows.length} fixed and confirmed by a re-check in the last 24h` +
+        (unconfirmedRows.length > 0 ? ` (${unconfirmedRows.length} more applied without confirmation)` : '') + ', ' +
         `${driftPending} external schema change${driftPending === 1 ? '' : 's'} pending adoption.`,
       ]
       if (openRows.length > 0) {
@@ -2962,8 +2972,12 @@ export async function dispatchTool(
         for (const a of approvals) lines.push(`- ${a.tool} on ${a.target} (id=${a.id})`)
       }
       if (fixedRows.length > 0) {
-        lines.push('', 'Auto-fixed in the last 24h:')
+        lines.push('', 'Fixed in the last 24h, each confirmed by a re-check:')
         for (const r of fixedRows.slice(0, 5)) lines.push(`- ${r.summary}`)
+      }
+      if (unconfirmedRows.length > 0) {
+        lines.push('', 'Applied in the last 24h but NOT confirmed (nothing could re-check them; verify before relying on them):')
+        for (const r of unconfirmedRows.slice(0, 5)) lines.push(`- ${r.summary}`)
       }
       if (driftPending > 0) {
         lines.push('', `${driftPending} schema change(s) arrived over a direct DB connection — call adopt_external_schema to fold them into the contract, or review under Autonomy.`)
@@ -2972,7 +2986,18 @@ export async function dispatchTool(
         lines.push('', `Latest restore point: v${snapshot.versionNum} (${snapshot.tableCount} tables, ${snapshot.createdAt.toISOString()}). Rollback is available from Autonomy → Restore points.`)
       }
       if (openRows.length === 0 && approvals.length === 0 && driftPending === 0) {
-        lines.push('', 'Nothing needs attention — the backend is healthy and the loop is quiet.')
+        // An empty queue is evidence only for the checks that ran. Say which
+        // could not, rather than calling the backend healthy.
+        const blind = sensors?.errored ?? []
+        lines.push(
+          '',
+          sensors
+            ? `Nothing is waiting: the ${sensors.ran} check(s) that ran on the last pass (${sensors.at}) found no issues.` +
+              (blind.length > 0
+                ? ` ${blind.length} check(s) could not run (${blind.map((b) => b.title).slice(0, 3).join(', ')}), so problems there would not appear here.`
+                : '')
+            : 'Nothing is waiting, but there is no recent record of which checks ran, so this is not a statement that the backend is healthy.',
+        )
       }
 
       return finalize({
@@ -2986,7 +3011,12 @@ export async function dispatchTool(
           escalatedFindings,
           /** The number a UI should show as "waiting on you" — the two combined. */
           waitingOnHuman: waitingTotal,
+          /** Repairs a re-check confirmed. */
           autoFixedLast24h: fixedRows,
+          /** Repairs that ran without confirmation — not fixes until re-checked. */
+          appliedUnconfirmedLast24h: unconfirmedRows,
+          /** Which checks the loop's last pass could run. */
+          sensors,
           pendingDriftEvents: driftPending,
           latestRestorePoint: snapshot,
         },
@@ -3130,10 +3160,11 @@ async function runExecutor(
   action: AIAction,
   ctx: ToolDispatchContext,
 ): Promise<ToolResult> {
-  // If the user authorised destructive action this turn (e.g. "yes drop it"),
-  // forward `confirmed:true` so the executor's approval gate does not block on
-  // a confirmation it already has via the brain layer. Brain's DESTRUCTIVE_TOOLS
-  // set is the first gate; this keeps the second gate aligned.
+  // When a human approved this exact call (lib/mcp/approvals.ts sets
+  // destructiveConfirmed on the approved dispatch only), or the MCP tool route
+  // already applied its own approval rule, forward `confirmed:true` so the
+  // executor's second gate does not ask again for a confirmation that was
+  // already given. The brain's agent loop never sets either flag.
   const params = (ctx.destructiveConfirmed || ctx.mcpOwnerConfirmed)
     ? { ...(action.params || {}), confirmed: true }
     : action.params
@@ -3346,5 +3377,20 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'rollback': return `Rolling back ${args.steps ?? 1} step(s)`
     case 'finish': return 'Wrapping up'
     default: return name
+  }
+}
+
+/**
+ * A stored diagnosis with its source made explicit for agents. A deterministic
+ * investigation concluded from observations it made; anything else (including a
+ * diagnosis with no recorded source) is a model-written hypothesis nothing has
+ * verified, and is labelled so an agent does not act on it as fact.
+ */
+function withProvenance(diagnosis: unknown): unknown {
+  if (!diagnosis || typeof diagnosis !== 'object' || Array.isArray(diagnosis)) return diagnosis
+  const d = diagnosis as Record<string, unknown>
+  return {
+    ...d,
+    provenance: d.model === 'deterministic-investigation' ? 'investigation' : 'ai_hypothesis',
   }
 }
