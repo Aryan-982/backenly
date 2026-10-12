@@ -81,6 +81,7 @@ import { FOCUS, FOCUS_INSET } from '@/components/console/tokens'
 import {
   levelLabel, useAutonomyStatus, type AutonomyLastAction,
 } from '@/lib/hooks/useAutonomyStatus'
+import { useAgentConnection } from '@/lib/hooks/useAgentConnection'
 import { type GroupableFinding } from '@/lib/core/finding-groups'
 import { freshlyVerifiedRepairs, quietState as quietStateFor, type SensorSummary } from '@/components/workspace/health-state'
 import { ObservabilityStrip } from '@/components/workspace/ObservabilityStrip'
@@ -208,6 +209,7 @@ export function WorkspaceHome({
   const [health, setHealth]     = useState<HealthData | null>(null)
   const [stats, setStats]       = useState<DashboardStats | null>(null)
   const { status: autonomy, refresh: refreshAutonomy } = useAutonomyStatus(hasBackend ? projectId : null)
+  const agentConnection = useAgentConnection(projectId)
 
   // Whether the last /health read failed. Without it a failed load looked like
   // "nothing is wrong", and the headline below would have said all clear.
@@ -415,11 +417,16 @@ export function WorkspaceHome({
       body: 'Backenly flagged some issues while checking the runtime. Auto-fix them here, or hand them to your coding agent.',
       cta: { label: 'Review in Autonomy', onClick: () => router.push(`/app/projects/${projectId}/autonomy`) },
     }
-    : verdict === 'structure_ready' ? {
+    : verdict === 'structure_ready' ? (agentConnection.connected ? {
+      headline: 'Built and standing by',
+      body: 'Your backend is ready and your agent is connected. Backenly watches every change it makes, live: schema, APIs, auth, storage.',
+    } : {
       headline: 'Built and standing by',
       body: 'Your backend is ready. Point your coding agent at it and Backenly starts watching every change live: schema, APIs, auth, storage.',
-      cta: { label: 'Connect your agent', onClick: () => router.push(`/app/projects/${projectId}/connect`) },
-    }
+      cta: agentConnection.needsConnect
+        ? { label: 'Connect your agent', onClick: () => router.push(`/app/projects/${projectId}/connect`) }
+        : undefined,
+    })
     : quietState
 
   // ── Loop phase (derived from real state, never animated fiction) ─────────

@@ -27,6 +27,7 @@ import {
   Tag,
 } from '@/components/inspector/kit'
 import { PAGE_GUTTER, PAGE_WIDTH } from '@/components/console/tokens'
+import { refreshAgentConnection } from '@/lib/hooks/useAgentConnection'
 
 interface ApiKey {
   id: string
@@ -168,6 +169,9 @@ export function ClientKeysPanel() {
       setToast({ message: `Deleted “${pendingDelete.name}”`, type: 'success' })
       setPendingDelete(null)
       await loadApiKeys()
+      // This list includes agent keys and OAuth connections; deleting the last
+      // one disconnects the agent, which the top bar should show now.
+      if (projectId) void refreshAgentConnection(projectId)
     } catch (error: any) {
       setToast({ message: error.message || 'Failed to delete API key', type: 'error' })
     } finally {
