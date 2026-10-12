@@ -190,7 +190,7 @@ npx -y @backenly/cli@latest chat "add likes and comments to posts"`,
             {
               label: 'Agent',
               title: 'Polls `check_approval`',
-              body: 'Terminal statuses distinguish `failed` (nothing applied, safe to retry) from `partial` (some changes landed, so verify current state instead of replaying).',
+              body: 'A terminal status is final. After `failed`, the agent checks the current state before raising the request again, because a call that stops part-way can leave some of its work applied.',
             },
           ],
         },

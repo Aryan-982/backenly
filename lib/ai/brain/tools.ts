@@ -187,8 +187,9 @@ export type ToolName =
 
 /**
  * Tools whose effect is data loss, breaks live consumers, or reverts production.
- * The agent loop refuses to call these without `destructiveConfirmed=true` on
- * the BrainInput (which is set from a "yes / confirm / drop / revoke" message).
+ * The agent loop never runs these itself: its gate (`needsApproval`, which also
+ * covers executors rated high-risk) stops the call and the caller queues it,
+ * exactly as issued, for a human to approve. No message can authorise one.
  * The executor also has its own approval-gate as defence-in-depth.
  */
 const DESTRUCTIVE_TOOLS = new Set<ToolName>([
@@ -942,7 +943,7 @@ export const BRAIN_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     'List open / pending health findings (issues the platform detected) for this project — id, type, severity, target table/column, reason. Use to map a problem (e.g. a pasted error screenshot or "fix this") to a concrete issue before resolve_finding. Side-effect free.',
     {}),
   fn('resolve_finding',
-    'Resolve a detected health finding through the governed fix engine. Pass findingId (from list_findings or the diagnostic context). If you only know the kind of problem, pass findingType and/or tableName/columnName and the closest match is resolved. Safe/additive fixes (FK, RLS, index, API) apply immediately and are verified; auth/destructive/irreversible fixes return a confirmation request — relay it to the user and only call again after they confirm.',
+    'Resolve a detected health finding through the governed fix engine. Pass findingId (from list_findings or the diagnostic context). If you only know the kind of problem, pass findingType and/or tableName/columnName and the closest match is resolved. Safe/additive fixes (FK, RLS, index, API) apply immediately and are verified. Auth/destructive/irreversible fixes are not applied here: the result says the fix needs a person\'s approval in the Review Queue (Autonomy page). Relay that, and do not call again for the same finding: no message can approve it.',
     {
       findingId: { type: 'string', description: 'Exact finding id (preferred — from list_findings or the diagnostic context).' },
       findingType: { type: 'string', description: 'e.g. missing_fk, missing_rls, integration_smtp_unreachable — used to match a finding when no id is known.' },
@@ -1208,7 +1209,7 @@ export const BRAIN_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 
   // ── Auth lifecycle ────────────────────────────────────────────────────────
   fn('reset_end_user_password',
-    'Reset an end-user\'s password. Generates a secure temporary password and returns it so the project owner can hand it to the user out-of-band — it does NOT email the user. Accepts either userId or email.',
+    'Send an end-user a single-use password reset link by email (expires in 1 hour). Their password changes only when they use the link; no password is ever returned. Fails truthfully when the project has no email delivery configured. Accepts either userId or email.',
     { userId: { type: 'string' }, email: { type: 'string' } }),
   fn('block_end_user',
     'DESTRUCTIVE. Block an end-user — their existing JWT tokens stop working immediately and they cannot sign in. Reversible via unblock_end_user. Requires confirmation.',
@@ -2867,8 +2868,8 @@ export async function dispatchTool(
         userId: ctx.userId,
       })
       // 'fixed' is success. needs_confirmation / notify / failed are surfaced as
-      // ok:false so the model relays the message (asks the user to confirm, or
-      // explains the manual step) rather than claiming it fixed something.
+      // ok:false so the model relays the message (where a person approves the
+      // fix, or the manual step) rather than claiming it fixed something.
       return finalize({
         ok: res.outcome === 'fixed',
         summary: clip(res.message),
@@ -3130,10 +3131,11 @@ async function runExecutor(
   action: AIAction,
   ctx: ToolDispatchContext,
 ): Promise<ToolResult> {
-  // If the user authorised destructive action this turn (e.g. "yes drop it"),
-  // forward `confirmed:true` so the executor's approval gate does not block on
-  // a confirmation it already has via the brain layer. Brain's DESTRUCTIVE_TOOLS
-  // set is the first gate; this keeps the second gate aligned.
+  // When a human approved this exact call (lib/mcp/approvals.ts sets
+  // destructiveConfirmed on the approved dispatch only), or the MCP tool route
+  // already applied its own approval rule, forward `confirmed:true` so the
+  // executor's second gate does not ask again for a confirmation that was
+  // already given. The brain's agent loop never sets either flag.
   const params = (ctx.destructiveConfirmed || ctx.mcpOwnerConfirmed)
     ? { ...(action.params || {}), confirmed: true }
     : action.params
