@@ -18,6 +18,7 @@
 
 import { prisma } from '@/lib/db'
 
+import { chat } from '@/lib/ai/llm/chat'
 export interface GeneratedFunction {
   id: string
   name: string
@@ -251,14 +252,10 @@ async function generateFunctionCode(
   functionName: string,
   method: string
 ): Promise<string> {
-  const { getOpenAIClient } = await import('./openai-service')
-  const { getModel } = await import('./model-router')
-  const openai = getOpenAIClient()
-
   const schemaContext = await buildSchemaContext(projectId, description)
 
-  const response = await openai.chat.completions.create({
-    model: getModel('plan'),
+  const response = await chat({
+    purpose: 'functions.generate',
     messages: [{
       role: 'system',
       content: `You are a senior TypeScript backend engineer writing a Next.js API route handler.
@@ -281,11 +278,10 @@ The file exports an async function named ${method.toUpperCase()} that accepts (r
 
 Use the real schema given above — the table and column names there are authoritative. Do not invent columns.`,
     }],
-    temperature: 0.2,
-    max_tokens: 1600,
+    label: 'function-generator',
   })
 
-  const raw = response.choices[0].message.content?.trim() ?? ''
+  const raw = response.text?.trim() ?? ''
   return stripCodeFences(raw)
 }
 
@@ -310,11 +306,7 @@ export async function generateFixedRouteModule(
   projectId: string
 ): Promise<string | null> {
   try {
-    const { getOpenAIClient } = await import('./openai-service')
-    const { getModel } = await import('./model-router')
     const { validateRouteModule } = await import('@/lib/services/ai-functions/route-module-runner')
-    const openai = getOpenAIClient()
-
     // The repair pass gets the SAME grounding as generation. A repair prompt
     // without the schema is the identical blind guess that produced the broken
     // code — and it is worse here, because the error being repaired is usually
@@ -322,8 +314,8 @@ export async function generateFixedRouteModule(
     // model has no way to diagnose without seeing the table.
     const schemaContext = await buildSchemaContext(projectId, description)
 
-    const response = await openai.chat.completions.create({
-      model: getModel('plan'),
+    const response = await chat({
+      purpose: 'functions.generate',
       messages: [{
         role: 'system',
         content: `You are a senior TypeScript backend engineer fixing a broken Next.js API route handler.
@@ -346,11 +338,10 @@ ${originalCode}
 Fix the code so it satisfies the runtime contract and its purpose.
 Check the error against the real schema above — a runtime failure here is most often a wrong column name, a missing ::uuid cast, an un-serialisable BigInt from COUNT(*), or a value that violates a CHECK constraint.`,
       }],
-      temperature: 0.1,
-      max_tokens: 1600,
+      label: 'function-repair',
     })
 
-    const fixed = stripCodeFences(response.choices[0].message.content?.trim() ?? '')
+    const fixed = stripCodeFences(response.text?.trim() ?? '')
     if (!fixed || fixed === originalCode.trim()) return null
 
     const check = validateRouteModule(fixed, method)

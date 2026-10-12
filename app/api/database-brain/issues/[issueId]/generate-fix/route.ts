@@ -2,10 +2,11 @@ export const dynamic = 'force-dynamic'
 
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db/postgres'
-import { chatCompletion, isAIEnabled } from '@/lib/openai/client'
 import { requireAuth } from '@/lib/auth/middleware'
 import { getCurrentProjectId } from '@/lib/tenant/isolation'
 
+import { chat } from '@/lib/ai/llm/chat'
+import { aiAvailability } from '@/lib/ai/llm'
 /**
  * Generate a fix for a database issue.
  *
@@ -43,11 +44,11 @@ export async function POST(request: NextRequest, props: { params: Promise<{ issu
     await requireAuth(request)
     const projectId = await getCurrentProjectId(request)
 
-    if (!isAIEnabled()) {
+    if (!aiAvailability().available) {
       return NextResponse.json(
         {
           success: false,
-          error: 'OpenAI is not enabled. Please set OPENAI_API_KEY in your environment.',
+          error: 'AI is not configured on this deployment.',
         },
         { status: 400 }
       )
@@ -92,7 +93,9 @@ Format your response as JSON with the following structure:
   "warnings": "Any warnings or considerations"
 }`
 
-    const response = await chatCompletion([
+    const response = await chat({
+      purpose: 'insight.explain',
+      messages: [
       {
         role: 'system',
         content: 'You are a database optimization expert. Provide clear, safe SQL statements and migration steps. Always include safety considerations.',
@@ -101,13 +104,11 @@ Format your response as JSON with the following structure:
         role: 'user',
         content: prompt,
       },
-    ])
+    ],
+      label: 'database-brain-fix',
+    })
 
-    if (!response || !response.choices || !response.choices[0]) {
-      throw new Error('No response from OpenAI')
-    }
-
-    const content = response.choices[0].message?.content || ''
+    const content = response.text || ''
     
     let generatedFix
     try {
