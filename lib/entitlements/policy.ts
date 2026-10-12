@@ -235,6 +235,20 @@ export async function enforceAiCredits(billingAccountId: string): Promise<true |
 }
 
 /**
+ * The AI credits an account has this month: its plan's, plus bonus and
+ * purchased credits. Null when there is nothing to enforce (no entitlements,
+ * or unlimited). Throws when the entitlements cannot be read; callers decide
+ * whether that fails open.
+ */
+export async function aiCreditCap(billingAccountId: string): Promise<number | null> {
+  const ent = await getAccountEntitlements(billingAccountId)
+  if (!ent) return null
+  const max = ent.monthlyAiCredits
+  if (max === null || max === undefined) return null
+  return max + (await bonusCredits(billingAccountId)) + (await purchasedCredits(billingAccountId))
+}
+
+/**
  * Charge a completed AI turn's actual token usage.
  *
  * The ledger this writes to is commercial, so the write itself belongs to the

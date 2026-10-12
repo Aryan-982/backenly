@@ -7,7 +7,6 @@
  * No complexity. No architecture. Just: AI → Backend.
  */
 
-import { getOpenAIClient } from './openai-service'
 import { isReservedWorkspaceTable } from '@/lib/security/workspace-schema'
 import { getActiveGraph, saveNewGraph } from '@/lib/orchestration/graph-pointer'
 import { withTimeout } from './with-timeout'
@@ -18,6 +17,7 @@ import { USER_ROLE_ID_BASES as _SEMANTIC_USER_ROLE_ID_BASES, USER_SEMANTIC_COLS 
 import { writeDecisionEntry, extractFkInferences } from '@/lib/memory/decision-memory'
 import { riskLevelForExecutorAction, queuePendingActionFinding } from '@/lib/operational-memory/ledger'
 import { plaintextForStorage } from '@/lib/auth/api-key-plaintext'
+import { chat } from '@/lib/ai/llm/chat'
 
 export interface AIAction {
   /** Optional trace explaining why this action was chosen — aids debugging hallucinations */
@@ -1409,8 +1409,6 @@ export async function extractAction(
   // SYSTEM 1: Live Schema Injection
   const liveSchema = await introspectSchema(projectId)
   
-  const openai = getOpenAIClient()
-  
   // Check if this is an INSERT_DATA request - if so, get schema first
   const isInsertRequest = /insert|add.*data|mock.*data|sample.*data|test.*data/i.test(userMessage)
   let schemaContext = ''
@@ -1514,7 +1512,7 @@ AUTH:
 - LIST_USERS - List the project's end-users (people who signed up via the project's auth)
 - BLOCK_USER - Block an end-user from signing in
 - UNBLOCK_USER - Unblock a previously blocked end-user
-- RESET_PASSWORD - Reset an end-user's password (returns a temporary password to share out-of-band)
+- RESET_PASSWORD - Email an end-user a single-use password reset link (never returns a password)
 
 Built-in auth endpoints (always available — no action needed, already live):
   POST /v1/{projectId}/auth/signup            — register end-user
@@ -1911,18 +1909,18 @@ Error: ${previousError}
     console.log('[Replanning] Retrying with error context:', previousError.substring(0, 100))
   }
 
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4.1',
+  const response = await chat({
+    purpose: 'build.plan',
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: enhancedUserMessage },
     ],
-    temperature: 0.1,
-    max_tokens: 500,
-    response_format: { type: 'json_object' },
+    maxTokens: 500,
+    json: true,
+    label: 'action-extractor',
   })
 
-  const extracted = JSON.parse(response.choices[0].message.content || '{"action":"UNKNOWN"}')
+  const extracted = JSON.parse(response.text || '{"action":"UNKNOWN"}')
   
   console.log('[AI Executor] Extracted action:', extracted)
   
@@ -3318,10 +3316,12 @@ async function executeSingleAction(
       console.error('[ApprovalGate] Failed to queue pending action finding:', error)
     }
 
-    const verb = riskLevel === 'high' ? 'delete' : 'confirm'
+    // No message approves this: the owner approves the queued finding in
+    // Autonomy, which runs exactly these params. Suggesting a phrase to type
+    // would tell an agent, or the person reading it, something untrue.
     return {
       success: false,
-      message: `⛔ \`${action.action}\`${target ? ` on \`${target}\`` : ''} requires confirmation (${riskLevel} risk). Type \`confirm ${verb} ${target ?? 'this'}\` to proceed now, or review it under Autonomy.`,
+      message: `⛔ \`${action.action}\`${target ? ` on \`${target}\`` : ''} was not run: it is a ${riskLevel}-risk action and is waiting for the project owner's approval in the Review Queue (Autonomy). Approving it there runs exactly this action.`,
       error: 'APPROVAL_REQUIRED',
     }
   }
@@ -5699,6 +5699,8 @@ async function executeDropTable(params: any, projectId: string): Promise<Executi
     await prisma.$executeRawUnsafe(`DROP TABLE IF EXISTS "${postgresSchema}"."${tableName}" CASCADE`)
     await prisma.table.deleteMany({ where: { projectId, name: tableName } })
     await prisma.apiDefinition.deleteMany({ where: { projectId, name: tableName } })
+    const { supersedeSchemaIntent } = await import('@/lib/autonomy/intent-conformance')
+    await supersedeSchemaIntent(projectId, { kind: 'drop_table', tableName })
 
     // Best-effort: strip the entity from the BackendStateGraph so graph-based
     // API counts stay in sync. Failure here must never block the deletion itself.
@@ -6049,6 +6051,11 @@ async function executeDropColumn(params: any, projectId: string): Promise<Execut
     await prisma.$executeRawUnsafe(
       `ALTER TABLE "${postgresSchema}"."${tableName}" DROP COLUMN IF EXISTS "${columnName}" CASCADE`
     )
+
+    // The drop was asked for, so the column is no longer requested: without
+    // this the intent ledger would report it missing (lib/autonomy/intent-conformance).
+    const { supersedeSchemaIntent } = await import('@/lib/autonomy/intent-conformance')
+    await supersedeSchemaIntent(projectId, { kind: 'drop_column', tableName, columnName })
 
     // Regenerate the REST API for this table so the column disappears from
     // its generated CRUD payloads. Non-fatal — the column is gone either way.
@@ -7510,64 +7517,85 @@ async function executeBlockUser(params: any, projectId: string): Promise<Executi
 }
 
 /**
- * AUTH: Reset Password
- * Generates a secure temporary password, hashes it, and updates the workspace user.
- * Returns the temp password to the admin so they can share it out-of-band.
+ * AUTH: Reset Password — emails the end user a single-use reset link.
+ *
+ * Starts the same flow as the app's own "forgot password"
+ * (lib/services/end-user-auth-flows.ts): the person who owns the account gets
+ * the link, the password changes only when THEY use it, and no credential is
+ * ever returned to the caller. A password is something only its owner should
+ * ever hold, so no tool sets one on their behalf.
  */
 async function executeResetPassword(params: any, projectId: string): Promise<ExecutionResult> {
   const { userId, email } = params
   if (!userId && !email) return { success: false, message: 'userId or email is required' }
 
   try {
-    const { prisma } = await import('@/lib/db')
-    const crypto = await import('crypto')
-    const { hashPassword } = await import('@/lib/auth/password')
     const schemaName = `workspace_${projectId}`
 
-    // Detect which column actually stores the password hash. Standard projects
-    // use "password" (signup DDL); AI-generated schemas sometimes use
-    // "password_hash". The signin route already detects this — match its
-    // behaviour so reset works on either layout instead of failing silently
-    // ("UPDATE 0 rows") when the column doesn't exist.
-    const pwColRows = await prisma.$queryRawUnsafe<{ column_name: string }[]>(
-      `SELECT column_name FROM information_schema.columns
-       WHERE table_schema = $1 AND table_name = 'users'
-         AND column_name IN ('password', 'password_hash') LIMIT 1`,
-      schemaName,
-    )
-    const pwCol = pwColRows[0]?.column_name ?? 'password'
-
-    // Verify user exists
+    // Resolve the account's email address, which is where the link goes.
+    // Service-role read: FORCE row-level security hides end-user rows from a
+    // claimless query under the production role, which would report a real
+    // account as missing.
+    const { executeWithUserContext } = await import('@/lib/services/workspace-rls')
     const identifier = email ? 'email' : 'id'
-    const paramValue = email || userId
-    const users = await prisma.$queryRawUnsafe<any[]>(
+    const paramValue = String(email || userId)
+    const users = await executeWithUserContext<{ id: string; email: string | null }>(
+      '',
+      true,
       `SELECT id, email FROM "${schemaName}"."users" WHERE "${identifier}" = $1 LIMIT 1`,
-      paramValue
+      [identifier === 'email' ? paramValue.toLowerCase().trim() : paramValue],
     )
-
-    if (!users[0]) {
+    const target = users[0]
+    if (!target) {
       return { success: false, message: `User "${paramValue}" not found in this project` }
     }
+    if (!target.email) {
+      return {
+        success: false,
+        message: `User "${paramValue}" has no email address, so a reset link cannot be sent. No password was changed.`,
+      }
+    }
 
-    const targetUser = users[0]
-
-    // Generate a secure random temp password (16 chars)
-    const tempPassword = crypto.randomBytes(8).toString('hex')
-    const hashed = await hashPassword(tempPassword)
-
-    await prisma.$executeRawUnsafe(
-      `UPDATE "${schemaName}"."users" SET "${pwCol}" = $1 WHERE id = $2`,
-      hashed,
-      targetUser.id
+    // The same per-recipient budget the public forgot-password route applies,
+    // so this door cannot be used to flood one person's inbox either.
+    const { consume, AUTH_LIMITS } = await import('@/lib/security/auth-rate-limit')
+    const recipient = target.email.trim().toLowerCase()
+    const limit = await consume(
+      `v1:endUserRecover:target:${projectId}:${recipient}`,
+      AUTH_LIMITS.endUserRecover.ip.limit,
+      AUTH_LIMITS.endUserRecover.ip.windowMs,
     )
+    if (!limit.allowed) {
+      // Two different refusals, and only one of them means a link already went out.
+      return {
+        success: false,
+        message:
+          limit.outcome === 'limit_exceeded'
+            ? `A reset link was sent to ${target.email} recently. Wait before sending another. No password was changed.`
+            : `Could not check the sending limit right now, so no reset link was sent. Try again shortly. No password was changed.`,
+      }
+    }
+
+    const { issueEndUserPasswordReset } = await import('@/lib/services/end-user-auth-flows')
+    const outcome = await issueEndUserPasswordReset(projectId, recipient)
+    if (!outcome.emailSent) {
+      return {
+        success: false,
+        message:
+          `Could not email a reset link to ${target.email}: email delivery is not configured for this ` +
+          `project (SMTP), or the send failed. No password was changed.`,
+      }
+    }
 
     return {
       success: true,
-      message: `✅ Password reset for **${targetUser.email}**\n\n**Temporary password** (share securely):\n\`\`\`\n${tempPassword}\n\`\`\`\n\nThe user must change this after signing in.`,
-      data: { userId: targetUser.id, email: targetUser.email, tempPassword },
+      message:
+        `✅ Sent a password reset link to **${target.email}**. It expires in 1 hour. ` +
+        `The password changes only when they use the link; nothing was changed now.`,
+      data: { userId: target.id, email: target.email, resetEmailSent: true },
     }
   } catch (error: any) {
-    return { success: false, message: `Failed to reset password: ${error.message}`, error: error.message }
+    return { success: false, message: `Failed to send a password reset: ${error.message}`, error: error.message }
   }
 }
 
@@ -8676,6 +8704,11 @@ async function executeRenameColumn(params: any, projectId: string, target: Schem
     await prisma.$executeRawUnsafe(
       `ALTER TABLE "${postgresSchema}"."${safe(tableName)}" RENAME COLUMN "${safe(oldName)}" TO "${safe(newName)}"`
     )
+    // The ledger describes MAIN; a branch's rename is applied when it is merged.
+    if (!target.targetSchema) {
+      const { supersedeSchemaIntent } = await import('@/lib/autonomy/intent-conformance')
+      await supersedeSchemaIntent(projectId, { kind: 'rename_column', tableName: safe(tableName), from: safe(oldName), to: safe(newName) })
+    }
     // Column renamed — evict cached Zod validation schema
     import('@/lib/services/workspace-validator').then(({ invalidateSchemaCache }) => invalidateSchemaCache(projectId, tableName)).catch(() => {})
     return {
@@ -12723,9 +12756,13 @@ async function executeAddFulltextSearch(params: any, projectId: string): Promise
 //   2. Adding an `embedding vector(1536)` column to the table (idempotent)
 //   3. Building an HNSW index for cosine similarity (idempotent; falls back
 //      to ivfflat if the installed pgvector predates HNSW)
-//   4. Recording the source-columns mapping in ApiDefinition.config.vectorSearch
-//      so runtimeApiExecutor can auto-embed on writes and the new
+//   4. Recording the source columns, model and dimensions in
+//      ApiDefinition.config.vectorSearch, so the
 //      /api/v1/{projectId}/db/{table}/vector-search endpoint can serve queries
+//      and refuse when the deployment's model no longer matches
+//
+// Nothing computes a row's embedding when it is written: writes go straight to
+// the data plane. Every surface that describes this tool says so.
 // ============================================================================
 
 async function executeEnableVectorSearch(params: any, projectId: string): Promise<ExecutionResult> {
@@ -12739,6 +12776,18 @@ async function executeEnableVectorSearch(params: any, projectId: string): Promis
   const requested: string[] = Array.isArray(sourceColumns) && sourceColumns.length > 0
     ? sourceColumns
     : ['title', 'name', 'body', 'description', 'content', 'text']
+
+  // Before any DDL: a search column nothing can query is a feature that only
+  // looks enabled.
+  const { embeddingAvailability, EMBEDDING_DIMENSIONS, EMBEDDING_MODEL } = await import('@/lib/ai/embeddings')
+  const available = embeddingAvailability()
+  if ('reason' in available) {
+    return {
+      success: false,
+      message: `Vector search was not enabled on **${tableName}**: ${available.reason}`,
+      error: 'EMBEDDINGS_UNAVAILABLE',
+    }
+  }
 
   try {
     const { prisma } = await import('@/lib/db')
@@ -12794,7 +12843,7 @@ async function executeEnableVectorSearch(params: any, projectId: string): Promis
 
     // 3. Add embedding column (idempotent).
     const EMBEDDING_COLUMN = 'embedding'
-    const DIMENSIONS = 1536  // text-embedding-3-small
+    const DIMENSIONS = EMBEDDING_DIMENSIONS
     await prisma.$executeRawUnsafe(`
       ALTER TABLE "${postgresSchema}"."${safeTable}"
       ADD COLUMN IF NOT EXISTS "${EMBEDDING_COLUMN}" vector(${DIMENSIONS})
@@ -12824,9 +12873,8 @@ async function executeEnableVectorSearch(params: any, projectId: string): Promis
       `)
     }
 
-    // 5. Persist the source-columns mapping in ApiDefinition.config so:
-    //    a) the runtime executor knows to auto-embed on writes
-    //    b) the /vector-search endpoint knows which columns are searchable
+    // 5. Persist the mapping in ApiDefinition.config, so the /vector-search
+    //    endpoint knows the column, and the model and dimensions it must match.
     const tablePrisma = await prisma.table.findFirst({ where: { projectId, name: tableName } })
     if (tablePrisma) {
       const apiDef = await prisma.apiDefinition.findFirst({ where: { projectId, tableId: tablePrisma.id } })
@@ -12836,7 +12884,7 @@ async function executeEnableVectorSearch(params: any, projectId: string): Promis
           enabled: true,
           embeddingColumn: EMBEDDING_COLUMN,
           dimensions: DIMENSIONS,
-          model: 'text-embedding-3-small',
+          model: EMBEDDING_MODEL,
           sourceColumns: validSources,
           indexName: idxName,
           indexKind,
@@ -12869,10 +12917,12 @@ async function executeEnableVectorSearch(params: any, projectId: string): Promis
       message:
         `✅ Vector search enabled on **${tableName}**.\n\n` +
         `- **Indexed source**: ${validSources.join(', ')}\n` +
-        `- **Embedding column**: \`${EMBEDDING_COLUMN} vector(${DIMENSIONS})\` (text-embedding-3-small)\n` +
+        `- **Embedding column**: \`${EMBEDDING_COLUMN} vector(${DIMENSIONS})\` (${EMBEDDING_MODEL})\n` +
         `- **Index**: \`${idxName}\` (${indexKind}, cosine similarity)\n` +
         `- **Search endpoint**: \`GET /api/v1/${projectId}/db/${tableName}/vector-search?q=your+question&limit=10\`\n\n` +
-        `New and updated rows are auto-embedded — your app just writes plain text and asks natural-language questions.`,
+        `Only rows with an \`${EMBEDDING_COLUMN}\` value are searched, and Backenly does not compute it when a row ` +
+        `is written yet: write it with the row (${DIMENSIONS} numbers from ${EMBEDDING_MODEL} over ` +
+        `${validSources.join(', ')}). Queries are plain text; Backenly embeds them.`,
       data: {
         tableName,
         embeddingColumn: EMBEDDING_COLUMN,

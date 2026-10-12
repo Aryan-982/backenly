@@ -141,7 +141,7 @@ export const article: ArticleData = {
             'Decide what the product should do. The loop fixes operational problems, not product problems.',
             'Approve anything destructive, credential-bearing, or irreversible.',
             'Own your frontend, your business logic, and your data model.',
-            'On self-hosting: the servers, the Postgres, the OpenAI key, and the upgrade cadence.',
+            'On self-hosting: the servers, the Postgres, the AI provider key, and the upgrade cadence.',
           ],
         },
         {

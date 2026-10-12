@@ -15,6 +15,7 @@
 
 import { prisma } from '@/lib/db'
 import { sanitizeDiagnostic } from '@/lib/errors/diagnostic-sanitize'
+import { aiAvailability } from '@/lib/ai/llm'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -148,8 +149,9 @@ async function checkEnvVars(): Promise<ReadinessCheck> {
   if (process.env.NODE_ENV === 'production' && !process.env.NEXT_PUBLIC_APP_URL) {
     warnings.push('NEXT_PUBLIC_APP_URL is not set — public API URLs will fall back to localhost')
   }
-  if (process.env.ENABLE_AI_FEATURES !== 'false' && !process.env.OPENAI_API_KEY) {
-    warnings.push('OPENAI_API_KEY is not set — AI features will be unavailable')
+  const ai = aiAvailability()
+  if (process.env.ENABLE_AI_FEATURES !== 'false' && 'reason' in ai) {
+    warnings.push(`${ai.reason} AI features will be unavailable.`)
   }
 
   if (missing.length > 0) {
