@@ -30,7 +30,7 @@ export const ROUTES = {
   features: '/features',
   useCases: '/use-cases',
   comparisons: '/comparisons',
-  resources: '/resources',
+  docs: '/docs',
   alternatives: '/alternatives',
   privacy: '/privacy',
   terms: '/terms',
@@ -89,7 +89,7 @@ const SHOW_LAUNCH_BAR = true
 
 const NAV_LINKS = [
   { label: 'Product', href: '/#capabilities', activePath: '/' },
-  { label: 'Resources', href: ROUTES.resources, activePath: ROUTES.resources },
+  { label: 'Docs', href: ROUTES.docs, activePath: ROUTES.docs },
   { label: 'Use cases', href: ROUTES.useCases, activePath: ROUTES.useCases },
   { label: 'Pricing', href: ROUTES.pricing, activePath: ROUTES.pricing },
   { label: 'Contact', href: ROUTES.contact, activePath: ROUTES.contact },
@@ -465,7 +465,7 @@ export function SiteFooter() {
     { label: 'CLI', href: 'https://www.npmjs.com/package/@backenly/cli' },
     { label: 'Agent skill', href: '/skill.md' },
     { label: 'llms.txt', href: '/llms.txt' },
-    { label: 'Documentation', href: ROUTES.resources },
+    { label: 'Documentation', href: ROUTES.docs },
   ]
   const company = [
     { label: 'Contact', href: ROUTES.contact },

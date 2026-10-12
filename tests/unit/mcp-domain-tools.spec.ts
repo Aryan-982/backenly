@@ -210,9 +210,9 @@ describe('what a read-only key discovers', () => {
     }
   })
 
-  it('is described in the Connect guide with the counts the catalog really serves', () => {
-    const { article } = require('@/app/resources/content/connect-your-coding-agent')
-    expect(JSON.stringify(article)).toContain(`served ${ro().length} tools instead of ${buildCatalog().length}`)
+  it('is described on the Connect docs page with the counts the catalog really serves', () => {
+    const { DOCS_BY_SLUG } = require('@/app/docs/content')
+    expect(JSON.stringify(DOCS_BY_SLUG.connect)).toContain(`served ${ro().length} tools instead of ${buildCatalog().length}`)
   })
 
   it('still withholds every write-only door', () => {

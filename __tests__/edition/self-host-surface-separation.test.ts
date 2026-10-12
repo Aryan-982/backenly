@@ -70,7 +70,7 @@ describeOss('self-host surface separation', () => {
         'alternatives',
         'features',
         'use-cases',
-        'resources',
+        'docs',
         'contact',
         'terms',
         'privacy',
@@ -85,12 +85,29 @@ describeOss('self-host surface separation', () => {
       }
     })
 
+    it('keeps /docs/llms.txt answering off Cloud, though /docs is marketing', () => {
+      // The published CLI and older MCP setup prompts fetch /docs/llms.txt, and
+      // middleware runs before the rewrite that serves it, so without the
+      // exemption a self-hosted install would bounce an agent to /app.
+      // Raw source: see the note on the next test about code() and this region.
+      const mw = read('middleware.ts')
+      expect(mw).toMatch(/const marketingExemptions = \['\/docs\/llms\.txt'\]/)
+      const fn = mw.slice(mw.indexOf('function isMarketingPath'))
+      expect(fn.indexOf('marketingExemptions')).toBeGreaterThan(-1)
+      expect(fn.indexOf('marketingExemptions')).toBeLessThan(fn.indexOf('marketingPrefixes'))
+    })
+
     it('never blocks the routes that reach the product', () => {
-      const mw = code('middleware.ts')
-      const marketingBlock = mw.slice(
-        mw.indexOf('const marketingRoutes'),
-        mw.indexOf('function isMarketingPath')
-      )
+      // Raw source, not code(). The comment above these lists names `/auth/*`,
+      // and code() reads that `/*` as the start of a block comment, which erased
+      // both markers below and left this test asserting against an empty
+      // string. The markers are asserted so it cannot go blind that way again.
+      const mw = read('middleware.ts')
+      const start = mw.indexOf('const marketingRoutes')
+      const end = mw.indexOf('function isMarketingPath')
+      expect(start).toBeGreaterThan(-1)
+      expect(end).toBeGreaterThan(start)
+      const marketingBlock = mw.slice(start, end)
       for (const keep of ['/auth', '/login', '/signup', '/app']) {
         expect(marketingBlock).not.toContain(`'${keep}'`)
       }
