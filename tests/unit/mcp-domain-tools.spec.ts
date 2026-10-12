@@ -363,6 +363,13 @@ describe('runApprovedCall', () => {
     expect(out.summary).toMatch(/no such bucket/)
   })
 
+  it('never claims a failed call changed nothing, since a multi-step call can stop part-way', async () => {
+    const out = await runApprovedCall('trigger_deploy', {}, ctx, async () => ({ ok: false, summary: 'migration step failed' }))
+    expect(out.status).toBe('failed')
+    expect(out.summary).not.toMatch(/nothing was applied|unchanged/i)
+    expect(out.summary).toMatch(/read the current state/)
+  })
+
   it('reports a thrown or overrunning call as failed rather than hanging', async () => {
     const thrown = await runApprovedCall('delete_bucket', {}, ctx, async () => { throw new Error('boom') })
     const slow = await runApprovedCall('delete_bucket', {}, ctx, () => new Promise(() => {}), 50)

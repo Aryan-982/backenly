@@ -948,8 +948,9 @@ export interface ChatResolveResult {
  * tool). Classification-aware, mirroring the autonomy safety contract:
  *
  *   auto        → apply immediately through the governed executor + verify
- *   approval    → only apply when the user has confirmed this turn; otherwise
- *                 return needs_confirmation with the risk so the brain can ask
+ *   approval    → only apply on a human's approval (`confirmed`, which only an
+ *                 approved Review Queue call sets); otherwise return
+ *                 needs_confirmation, naming the risk and where to approve it
  *   notify_only → return the manual-remediation guidance, never auto-act
  *
  * Reuses executeApprovedFix for the actual governed execution (advisory lock +
@@ -981,9 +982,28 @@ export async function resolveFindingFromChat(
 
   if (cls.decision === 'approval' && !opts.confirmed) {
     const risk = cls.riskNote ? ` (${cls.riskNote})` : ''
+    // No chat message can approve it, so put it where a person can, as the
+    // autonomy loop does: the Review Queue lists pending_approval findings only.
+    // Inviting a reply of "confirm" instead would reach nothing waiting and
+    // change nothing.
+    const queued = await prisma.healthFinding.updateMany({
+      where: { id: findingId, status: 'open' },
+      data: { status: 'pending_approval' },
+    })
+    if (queued.count > 0) {
+      await _writeAuditLog(projectId, 'HEALTH_FIX_AWAITING_APPROVAL', {
+        findingId,
+        findingType: type,
+        reason: cls.reason,
+        via: 'chat',
+      })
+    }
+    const waiting = queued.count > 0 || finding.status === 'pending_approval'
     return {
       outcome: 'needs_confirmation',
-      message: `${cls.reason}${risk} Confirm and I'll apply it.`,
+      message: waiting
+        ? `${cls.reason}${risk} This fix needs a person's approval, so it is waiting in the Review Queue on the Autonomy page, which shows exactly what it changes.`
+        : `${cls.reason}${risk} This fix needs a person's approval in the dashboard; a chat message cannot approve it.`,
       findingId,
       findingType: finding.type,
     }
