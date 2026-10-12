@@ -21,6 +21,7 @@ import { Pool } from 'pg'
 import { loadProjectMemory } from '@/lib/ai/project-memory'
 import { getWorkspaceDatabaseNames } from '@/lib/services/databaseProvisioning'
 
+import { chat } from '@/lib/ai/llm/chat'
 // ── Public types ─────────────────────────────────────────────────────────────
 
 export interface SimulationScenario {
@@ -272,8 +273,6 @@ async function llmAnalysis(
   tableStats: TableStat[],
   scenario: SimulationScenario,
 ): Promise<LLMAnalysis> {
-  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-  const model = process.env.OPENAI_MODEL ?? 'gpt-4o-mini'
 
   const tableList = tableStats
     .map(t => `${t.tablename} (${fmtNum(t.n_live_tup)} rows)`)
@@ -305,18 +304,18 @@ Scenario: ${scenario.label} (${scenario.multiplier}x scale, ${scenario.timeframe
 Identify the top performance bottlenecks and provide concrete SQL fixes where applicable.
 Focus on the most impactful issues only.`
 
-  const response = await client.chat.completions.create({
-    model,
+  const response = await chat({
+    purpose: 'insight.explain',
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ],
-    max_tokens: 1500,
-    temperature: 0.2,
-    response_format: { type: 'json_object' },
+    maxTokens: 1500,
+    json: true,
+    label: 'arch-simulator',
   })
 
-  const raw = response.choices[0]?.message?.content ?? '{}'
+  const raw = response.text ?? '{}'
   return JSON.parse(raw) as LLMAnalysis
 }
 
