@@ -139,6 +139,13 @@ __tests__/auth/operate-role-floors.test.ts
 # role, that the executor takes the service-role claims path, and the real
 # row flip both ways through the real executor door.
 __tests__/auth/block-user-rls.test.ts
+# ENABLE_REALTIME answered "Realtime active" for tables that never streamed: a
+# failed CREATE TRIGGER (missing/wrong-case table) was a footnote under the
+# banner, a refused table (internal, auth-managed users) was listed under
+# "Enabled by this call", and an empty project got "active for 0 table(s)".
+# Pins failure codes, refusal reasons, catalog read-back gating, the skipped
+# ledger on project-wide calls, and the honest empty-project answer.
+__tests__/services/realtime-enable-honesty.test.ts
 
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
