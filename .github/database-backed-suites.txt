@@ -162,6 +162,16 @@ __tests__/database/dashboard-row-writes-rls.test.ts
 # answer.
 __tests__/database/schema-version-snapshots.test.ts
 
+# Monitoring read what nothing writes: metrics/errors read the Log table (its
+# only writers are platform auth events with no projectId) and told every
+# project "No API metrics available yet" / "Your APIs are running smoothly"
+# while api_request_logs held the traffic and the 500s; the Logs tab was empty
+# forever. Pins metrics/errors derived from the runtime record (branch rows
+# excluded, windows honoured, session-timezone-proof bounds) and the explorer
+# serving the union of both stores with working filters and DB-side counts.
+__tests__/monitoring/monitoring-truth.test.ts
+
+
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
 # Postgres: a schema that exists, a row that was not duplicated, a refusal that
