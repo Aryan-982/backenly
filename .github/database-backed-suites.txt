@@ -622,6 +622,13 @@ __tests__/storage/storage-quota-follows-plan.test.ts
 # ways, fresh objects/rows spared by grace windows, dryRun inert. Real database;
 # S3 is the injected in-memory double the function signature exists for.
 __tests__/storage/storage-lifecycle-cleanup.test.ts
+# Bucket visibility must be TRUE: create_bucket/set_public wrote only the
+# isPublic label while serving, upload clamping and the console enforce
+# accessPolicy, so the agent was told "now private" after a leak while every
+# object kept serving to anonymous callers. Pins both fields written together,
+# the lock-down of a diverged legacy bucket, and read-backs (create message,
+# set_public, list_buckets) reporting the ENFORCED policy via the real mayRead.
+__tests__/storage/bucket-visibility-truth.test.ts
 
 # The usage ledger counts every metered quantity exactly once: batches applied
 # with an exactly-once id, a failed or ambiguous flush retried without double
