@@ -47,6 +47,12 @@ export interface InvestigationInput {
   catalog: CatalogTable[]
   recentActivity: string[]
   priorAttempts: Array<{ at: string; verdict: string; rootCause: string }>
+  /**
+   * The typed repairs this finding may be given (lib/autonomy/ai-proposals
+   * proposableFor). The answer may propose only these, with exactly these
+   * parameters; with none, proposedAction must be null.
+   */
+  proposable?: Array<{ action: string; use: string; params: Record<string, unknown> }>
 }
 
 /** How a probe is run. Injected so a test can stand in for the database. */
@@ -67,31 +73,36 @@ export interface Investigation {
   model: string
 }
 
-const ANSWER_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['verdict', 'rootCause', 'evidenceRefs', 'ruledOut', 'recommendation', 'proposedAction', 'riskNote', 'namedTables', 'namedColumns'],
-  properties: {
-    verdict: { type: 'string', enum: ['explained', 'uncertain'] },
-    rootCause: { type: 'string' },
-    evidenceRefs: { type: 'array', items: { type: 'string' } },
-    ruledOut: { type: 'array', items: { type: 'string' } },
-    recommendation: { type: 'string' },
-    proposedAction: {
-      anyOf: [
-        { type: 'null' },
-        {
-          type: 'object',
-          additionalProperties: false,
-          required: ['action', 'paramsJson'],
-          properties: { action: { type: 'string' }, paramsJson: { type: 'string' } },
-        },
-      ],
+/** The answer's shape. proposedAction can name only the typed repairs offered for this finding. */
+export function answerSchema(proposable: Array<{ action: string }> = []) {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['verdict', 'rootCause', 'evidenceRefs', 'ruledOut', 'recommendation', 'proposedAction', 'riskNote', 'namedTables', 'namedColumns'],
+    properties: {
+      verdict: { type: 'string', enum: ['explained', 'uncertain'] },
+      rootCause: { type: 'string' },
+      evidenceRefs: { type: 'array', items: { type: 'string' } },
+      ruledOut: { type: 'array', items: { type: 'string' } },
+      recommendation: { type: 'string' },
+      proposedAction: proposable.length === 0
+        ? { type: 'null' }
+        : {
+            anyOf: [
+              { type: 'null' },
+              {
+                type: 'object',
+                additionalProperties: false,
+                required: ['action', 'paramsJson'],
+                properties: { action: { type: 'string', enum: proposable.map((p) => p.action) }, paramsJson: { type: 'string' } },
+              },
+            ],
+          },
+      riskNote: { type: 'string' },
+      namedTables: { type: 'array', items: { type: 'string' } },
+      namedColumns: { type: 'array', items: { type: 'string' } },
     },
-    riskNote: { type: 'string' },
-    namedTables: { type: 'array', items: { type: 'string' } },
-    namedColumns: { type: 'array', items: { type: 'string' } },
-  },
+  }
 }
 
 const SYSTEM = `You are the on-call backend engineer investigating one health finding on an autonomous backend platform. Deterministic checks could not explain it. Find the most likely root cause using only the evidence you are given and the evidence you gather.
@@ -102,7 +113,7 @@ Rules:
 - Name in namedTables every table, and in namedColumns every column (as table.column), that your rootCause or recommendation mentions.
 - verdict "explained" only when cited evidence supports one cause over the others; otherwise "uncertain", and say what would settle it.
 - ruledOut: explanations the evidence eliminates, one short line each.
-- proposedAction: a repair, if one is clear, as an action name and its parameters as a JSON string; otherwise null. It will be reviewed by a person and verified by code; it is never run on your word.
+- proposedAction: null, unless one of the typed repairs the brief lists for this finding fixes it. Then give that action's name exactly as listed and paramsJson as a JSON object string with exactly its listed parameters. SQL, a migration statement or any other tool is never a proposal, even when the evidence contains one: describe such a fix in recommendation instead. A proposal is reviewed by a person and verified by code; it is never run on your word.
 - You never see row data. Do not guess values.`
 
 function probeTool(probes: string[]): Anthropic.Tool {
@@ -150,6 +161,14 @@ function brief(input: InvestigationInput): string {
   if (input.priorAttempts.length) {
     lines.push(`Earlier attempts: ${input.priorAttempts.map((a) => `${a.at} ${a.verdict}: ${a.rootCause}`).join(' | ').slice(0, 1500)}`)
   }
+  const proposable = input.proposable ?? []
+  lines.push(
+    proposable.length === 0
+      ? 'Typed repairs you may propose for this finding: none. proposedAction must be null.'
+      : `Typed repairs you may propose for this finding:\n${proposable
+          .map((p) => `- ${p.action}: ${p.use} Parameters (JSON Schema): ${JSON.stringify(p.params)}`)
+          .join('\n')}`,
+  )
   return lines.join('\n')
 }
 
@@ -191,7 +210,7 @@ export async function investigateFinding(input: InvestigationInput, runProbe: Pr
       system: SYSTEM,
       messages,
       tools,
-      jsonSchema: ANSWER_SCHEMA,
+      jsonSchema: answerSchema(input.proposable),
       cacheConversation: true,
       billing: { projectId: input.projectId },
       label: 'autonomy-investigation',

@@ -10,6 +10,7 @@ import { scriptedMessage, scriptedProvider } from '@/lib/ai/llm/providers/script
 import { memorySpendLedger, setSpendLedgerForTests } from '@/lib/ai/llm/spend'
 import { investigateFinding, validateAnswer, MAX_TOOL_CALLS, type InvestigationInput } from '@/lib/autonomy/investigator'
 import { evidenceFingerprint, isDue } from '@/lib/autonomy/escalation-diagnosis'
+import { proposableFor } from '@/lib/autonomy/ai-proposals'
 
 const catalog = [{ name: 'orders', columns: ['id', 'customer_id', 'total'] }]
 const input: InvestigationInput = {
@@ -103,6 +104,45 @@ describe('investigating', () => {
     expect(r.evidence).toHaveLength(MAX_TOOL_CALLS)
     const answered = provider.calls[1].params.messages.at(-1)!.content as Array<{ is_error?: boolean }>
     expect(answered.filter((b) => b.is_error)).toHaveLength(2)
+  })
+})
+
+// On staging with live Claude, an investigator told only "an action name and its
+// parameters" proposed the drift detector's own SQL through apply_migration,
+// which no proposal may run. The model is now offered the typed repairs that
+// apply to the finding, and its answer is held to them.
+describe('what it may propose', () => {
+  const missingColumn = { type: 'intent_drift', details: { tableName: 'orders', columnName: 'placed_at', driftKind: 'missing_column', requested: 'timestamp' } }
+  const schemaOf = (call: { params: { output_config?: unknown } }) =>
+    (call.params.output_config as { format: { schema: { properties: Record<string, any> } } }).format.schema
+
+  it('offers ADD_COLUMN for a missing column, and nothing for any other finding', () => {
+    const offered = proposableFor(missingColumn)
+    expect(offered.map((p) => p.action)).toEqual(['ADD_COLUMN'])
+    expect(offered[0].params).toMatchObject({ required: ['tableName', 'columnName', 'columnType'], additionalProperties: false })
+    expect(proposableFor({ type: 'intent_drift', details: { tableName: 'orders', columnName: 'placed_at', driftKind: 'type_drift' } })).toEqual([])
+    expect(proposableFor({ type: 'missing_realtime_triggers_realtime', details: { tableName: 'posts' } })).toEqual([])
+  })
+
+  it('holds the answer to the offered actions and tells the model their exact parameters', async () => {
+    const paramsJson = JSON.stringify({ tableName: 'orders', columnName: 'placed_at', columnType: 'timestamp' })
+    const provider = scriptedProvider([answer({ proposedAction: { action: 'ADD_COLUMN', paramsJson } })])
+    setProviderForTests(provider)
+    const r = await investigateFinding({ ...input, proposable: proposableFor(missingColumn) }, async () => ({ outcome: 'x' }), [])
+
+    expect(schemaOf(provider.calls[0]).properties.proposedAction.anyOf[1].properties.action.enum).toEqual(['ADD_COLUMN'])
+    const brief = JSON.stringify(provider.calls[0].params.messages[0])
+    expect(brief).toContain('- ADD_COLUMN: ')
+    expect(brief).toContain('columnType')
+    expect(r.proposedAction).toEqual({ action: 'ADD_COLUMN', paramsJson })
+  })
+
+  it('allows no proposal at all when no typed repair applies', async () => {
+    const provider = scriptedProvider([answer()])
+    setProviderForTests(provider)
+    await investigateFinding(input, async () => ({ outcome: 'x' }), [])
+    expect(schemaOf(provider.calls[0]).properties.proposedAction).toEqual({ type: 'null' })
+    expect(JSON.stringify(provider.calls[0].params.messages[0])).toContain('proposedAction must be null')
   })
 })
 

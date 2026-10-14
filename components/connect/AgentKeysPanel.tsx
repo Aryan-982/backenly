@@ -17,6 +17,7 @@
 
 import { useEffect, useState, useCallback } from 'react'
 import { AlertTriangle, Check, KeyRound, Plug2, ShieldCheck, Trash2, Zap } from 'lucide-react'
+import { refreshAgentConnection } from '@/lib/hooks/useAgentConnection'
 import {
   CopyField,
   EmptyState,
@@ -130,6 +131,9 @@ export function AgentKeysPanel({
       const res = await fetch(`/api/projects/${projectId}/mcp/keys/${id}`, { method: 'DELETE' })
       if (!res.ok) throw new Error('Revoke failed')
       fetchAll()
+      // Revoking the last used key disconnects the agent; the top bar and the
+      // empty states should say so now, not on the next focus.
+      void refreshAgentConnection(projectId)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Revoke failed')
     } finally {
@@ -156,6 +160,8 @@ export function AgentKeysPanel({
           ok: true,
           message: `Connected: ${data.toolCount} tools on ${data.project?.name ?? data.projectId}.`,
         })
+        // The test authenticated with the key, which is what marks it used.
+        void refreshAgentConnection(projectId)
       }
     } catch (err) {
       setTestResult({ ok: false, message: err instanceof Error ? err.message : 'Network error' })
