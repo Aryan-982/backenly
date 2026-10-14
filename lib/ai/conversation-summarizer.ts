@@ -11,10 +11,8 @@
  *  - Next session picks up exactly where it left off, no "I forgot" problem
  *
  * Storage: reuses ConversationMessage table (role='summary' is a valid String)
- * Cost: uses fast model — summarization is cheap
+ * Cost: the gateway's brain.summary route (low effort, no thinking) — summarization is cheap
  */
-
-import { getModel } from './model-router'
 
 /** Trigger summarization when total raw messages exceed this count */
 const SUMMARY_THRESHOLD = 20
@@ -137,7 +135,7 @@ export async function maybeSummarizeConversation(projectId: string): Promise<voi
     return !meta || meta.noSummarize !== true
   })
 
-  const summary = await generateSummary(summarizableMessages, rawCount)
+  const summary = await generateSummary(summarizableMessages, rawCount, projectId)
   if (!summary) return
 
   // Save as a summary ConversationMessage (replaces previous if exists)
@@ -157,26 +155,36 @@ export async function maybeSummarizeConversation(projectId: string): Promise<voi
   console.log(`[Summarizer] Summarized ${rawCount} messages for project ${projectId}`)
 }
 
+/** The summary's shape, as structured output: every object closed, every field required. */
+const SUMMARY_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['builtSoFar', 'decisions', 'userPreferences', 'currentFocus'],
+  properties: {
+    builtSoFar: { type: 'array', items: { type: 'string' } },
+    decisions: { type: 'array', items: { type: 'string' } },
+    userPreferences: { type: 'array', items: { type: 'string' } },
+    currentFocus: { type: 'string' },
+  },
+}
+
 async function generateSummary(
   messages: Array<{ role: string; content: string }>,
   rawCount: number,
+  projectId: string,
 ): Promise<ConversationSummary | null> {
   try {
-    const { getOpenAIClient } = await import('./openai-service')
-    const openai = getOpenAIClient()
+    const { generate } = await import('./llm')
 
     const transcript = messages
       .slice(-40) // Use last 40 messages max for summarization
       .map(m => `${m.role === 'ai' ? 'AI' : 'User'}: ${m.content.slice(0, 500)}`)
       .join('\n')
 
-    const response = await openai.chat.completions.create({
-      model: getModel('summarize'),
-      messages: [
-        {
-          role: 'system',
-          content: `You are a conversation summarizer for an autonomous backend platform (Backenly).
-Extract the key facts from this conversation and return valid JSON only.
+    const reply = await generate({
+      purpose: 'brain.summary',
+      system: `You are a conversation summarizer for an autonomous backend platform (Backenly).
+Extract the key facts from this conversation.
 
 Focus on:
 - What backend resources were built (table names, features)
@@ -184,26 +192,24 @@ Focus on:
 - User preferences and style (verbose/terse, what they liked/disliked)
 - What the user is currently working on
 
-Return ONLY this JSON structure:
-{
-  "builtSoFar": ["users table", "products table", "auth", "..."],
-  "decisions": ["chose JWT over session auth", "decided to add RLS for orders", "..."],
-  "userPreferences": ["prefers terse responses", "wants FKs enforced", "..."],
-  "currentFocus": "one sentence describing what they're building right now"
-}`,
-        },
-        {
-          role: 'user',
-          content: `Summarize this conversation:\n\n${transcript}`,
-        },
-      ],
-      temperature: 0,
-      max_tokens: 600,
-      response_format: { type: 'json_object' },
+Fields:
+- builtSoFar: e.g. ["users table", "products table", "auth"]
+- decisions: e.g. ["chose JWT over session auth", "decided to add RLS for orders"]
+- userPreferences: e.g. ["prefers terse responses", "wants FKs enforced"]
+- currentFocus: one sentence describing what they're building right now`,
+      messages: [{ role: 'user', content: `Summarize this conversation:\n\n${transcript}` }],
+      jsonSchema: SUMMARY_SCHEMA,
+      maxTokens: 1024,
+      billing: { projectId },
+      label: 'summarizer',
     })
 
-    const raw = response.choices[0].message.content || '{}'
-    const parsed = JSON.parse(raw)
+    const parsed = (reply.json ?? {}) as {
+      builtSoFar?: string[]
+      decisions?: string[]
+      userPreferences?: string[]
+      currentFocus?: string
+    }
 
     return {
       builtSoFar: parsed.builtSoFar || [],

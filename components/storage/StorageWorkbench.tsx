@@ -45,6 +45,7 @@ import {
 import { FOCUS_INSET } from '@/components/console/tokens'
 import { POLICY_LABELS, type AccessPolicy } from '@/lib/storage/access-policy'
 import { BucketPolicyDialog } from '@/components/storage/BucketPolicyDialog'
+import { useAgentConnection } from '@/lib/hooks/useAgentConnection'
 
 const ALL_BUCKETS = '__all__'
 
@@ -115,6 +116,7 @@ export function StorageWorkbench({ projectId: projectIdProp }: { projectId?: str
   const [uploading, setUploading] = useState(false)
   const [projectId, setProjectId] = useState<string | null>(projectIdProp ?? null)
   const [project, setProject] = useState<Project | null>(null)
+  const agent = useAgentConnection(projectId)
 
   const [actionError, setActionError] = useState<string | null>(null)
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null)
@@ -649,12 +651,14 @@ export function StorageWorkbench({ projectId: projectIdProp }: { projectId?: str
                       totalBuckets === 0 ? (
                         <div className="flex w-full flex-col items-center gap-4">
                           <AgentPrompt prompt="Add profile photo uploads: a private bucket, and only the owner can read their files." />
-                          <KitButton
-                            icon={Sparkles}
-                            onClick={() => router.push(projectId ? `/app/projects/${projectId}/connect` : '/app')}
-                          >
-                            Connect your agent
-                          </KitButton>
+                          {agent.needsConnect && (
+                            <KitButton
+                              icon={Sparkles}
+                              onClick={() => router.push(projectId ? `/app/projects/${projectId}/connect` : '/app')}
+                            >
+                              Connect your agent
+                            </KitButton>
+                          )}
                         </div>
                       ) : undefined
                     }

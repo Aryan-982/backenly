@@ -177,6 +177,7 @@ model Project {
   deployConfirmations     DeployConfirmation[]
   aiConfiguration         AiConfiguration?
   aiUsage                 AiUsage[]
+  aiFixProposals          AiFixProposal[]
   anomalies               Anomaly[]
   apiKeys                 ApiKey[]
   apiRequestLogs          ApiRequestLog[]
@@ -883,9 +884,11 @@ model ApiKey {
   //   "runtime" (default) — /api/v1/{projectId}/* runtime data API (SDK clients).
   //                         Cannot reach brain tools or any /api/mcp/* surface.
   //   "mcp"               — issued from the MCP setup page. Can call /api/mcp/*
-  //                         (brain chat + direct tool dispatch + runtime data).
-  //                         These can create/alter/drop tables — never embed
-  //                         them in a public client.
+  //                         only (brain chat, direct tool dispatch and the db_*
+  //                         row tools). These can create/alter/drop tables. The
+  //                         runtime API (/api/v1, /api/v2) refuses them from
+  //                         anywhere with MCP_KEY_IN_APP, so one is never an
+  //                         app's key (lib/security/key-placement.ts).
   // A leaked SDK key cannot drop tables; a leaked MCP key can. Splitting the
   // scope keeps that blast radius explicit and auditable.
   scope           String            @default("runtime")
@@ -1277,6 +1280,77 @@ model AiUsage {
   @@map("ai_usage")
 }
 
+/// Model spend for one month (UTC) against one of the deployment's limits:
+/// scope 'total' counts every call, 'platform' the calls Backenly pays for
+/// itself. Reserved before a call, settled after it (lib/ai/llm/spend.ts), so
+/// concurrent calls cannot overshoot a limit between check and charge.
+model AiSpendPeriod {
+  month       String // YYYY-MM, UTC
+  scope       String // total | platform
+  reservedUsd Decimal  @default(0) @db.Decimal(14, 6)
+  settledUsd  Decimal  @default(0) @db.Decimal(14, 6)
+  /// Calls whose result was lost after they were sent, booked at their full
+  /// reservation because a lost answer is not proof nothing ran.
+  unknownUsd  Decimal  @default(0) @db.Decimal(14, 6)
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  @@id([month, scope])
+  @@map("ai_spend_periods")
+}
+
+/// A repair an AI investigation proposed for one finding, bound to the exact
+/// evidence, parameters and catalog state it was proposed against. It runs only
+/// when a person approves that exact version (lib/autonomy/ai-proposals.ts),
+/// and only once: approval claims it with a conditional update.
+model AiFixProposal {
+  id                  String    @id @default(uuid())
+  projectId           String
+  findingId           String
+  /// pending | executing | executed | failed | rejected | stale | expired
+  status              String    @default("pending")
+  action              String
+  params              Json
+  /// Binds project, finding, evidence, action, params, the touched catalog,
+  /// the rollback contract and the verifier version. Approval must present it.
+  proposalVersion     String
+  evidenceFingerprint String
+  catalogFingerprint  String
+  model               String
+  rationale           String    @db.Text
+  expiresAt           DateTime
+  /// Set by the one approval that claimed it.
+  executionId         String?
+  decidedBy           String?
+  decidedAt           DateTime?
+  outcome             Json?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  project             Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, status])
+  @@index([findingId])
+  @@map("ai_fix_proposals")
+}
+
+/// One call's reservation. A call that never settles (the process died) is
+/// still accounted for: past `expiresAt` it is booked as unknown usage.
+model AiSpendHold {
+  id         String    @id @default(uuid())
+  month      String
+  scopes     String[]
+  purpose    String
+  model      String
+  amountUsd  Decimal   @db.Decimal(14, 6)
+  status     String    @default("reserved") // reserved | settled | released | unknown
+  chargedUsd Decimal?  @db.Decimal(14, 6)
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  settledAt  DateTime?
+
+  @@index([status, expiresAt])
+  @@map("ai_spend_holds")
+}
+
 // Billing-specific usage tracking (user-scoped, monthly)
 // `date` is stored as YYYY-MM for monthly reset
 model UserAiUsage {
@@ -1323,6 +1397,31 @@ model AccountAiUsage {
   @@unique([billingAccountId, date])
   @@index([date])
   @@map("account_ai_usage")
+}
+
+/// One customer-paid model call's hold on its account's AI credits
+/// (lib/entitlements/credit-holds.ts): reserved before it is sent, used at what
+/// it consumed until its turn is charged, then charged or released. Counts
+/// against the cap only while reserved or used and unexpired.
+model AiCreditHold {
+  id               String    @id @default(uuid())
+  billingAccountId String
+  /// YYYY-MM, matching account_ai_usage.date.
+  month            String
+  /// Worst case, in effective tokens.
+  tokens           Int
+  /// What the call actually used, once it ran.
+  usedTokens       Int?
+  /// reserved | used | charged | released
+  status           String    @default("reserved")
+  /// Taken inside a turn that will be charged; a call outside one is released when it settles.
+  turnScoped       Boolean   @default(false)
+  createdAt        DateTime  @default(now())
+  expiresAt        DateTime
+  settledAt        DateTime?
+
+  @@index([billingAccountId, month, status])
+  @@map("ai_credit_holds")
 }
 
 // A billing account's two credit balances, bonus and purchased, and the last

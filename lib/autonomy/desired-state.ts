@@ -781,6 +781,13 @@ export interface FixOutcome {
    * EXCLUDING the invariant the fix targeted.
    */
   regressions: string[]
+  /**
+   * Whether collateral damage was looked for. 'unavailable' when there was no
+   * before-state to compare against, and then `regressions` is empty because
+   * nothing looked, not because nothing broke. Only 'ran' supports a claim of
+   * "no regressions".
+   */
+  regressionCheck: 'ran' | 'unavailable'
   /** Safe to record as a verified fix. */
   accepted: boolean
   reason: string
@@ -813,16 +820,29 @@ export async function evaluateFixOutcome(
   gapDetails: Record<string, unknown>,
   before: readonly CheckState[] | null,
 ): Promise<FixOutcome> {
-  const base = normalizeFindingType(gapType, gapDetails)?.base ?? gapType
-  const owning = new Set(owningInvariantIds(gapType, gapDetails))
-
   // One diff serves both halves — the after-state is expensive, so it is
   // computed once here rather than once per check.
   const after = await computeDesiredStateDiff(projectId)
+  return judgeFixOutcome(gapType, gapDetails, after, before)
+}
+
+/**
+ * The verdict half of `evaluateFixOutcome`, given the after-state. Pure, so the
+ * rules are proven directly in tests without a database.
+ */
+export function judgeFixOutcome(
+  gapType: string,
+  gapDetails: Record<string, unknown>,
+  after: Pick<DesiredStateReport, 'invariants' | 'violations'>,
+  before: readonly CheckState[] | null,
+): FixOutcome {
+  const base = normalizeFindingType(gapType, gapDetails)?.base ?? gapType
+  const owning = new Set(owningInvariantIds(gapType, gapDetails))
+  const covered = probeCoveredTypes().has(base)
 
   // ── Target half ────────────────────────────────────────────────────────────
   let recheck: FixOutcome['recheck']
-  if (!probeCoveredTypes().has(base)) {
+  if (!covered) {
     recheck = 'unknown'
   } else {
     const key = gapIdentity(gapType, gapDetails)
@@ -840,6 +860,9 @@ export async function evaluateFixOutcome(
   }
 
   // ── Regression half ────────────────────────────────────────────────────────
+  // Without a before-state a regression cannot be told from a failure that was
+  // already there, so nothing is compared and the result says so.
+  const regressionCheck: FixOutcome['regressionCheck'] = before ? 'ran' : 'unavailable'
   const regressions: string[] = []
   if (before) {
     const afterChecks = new Map(
@@ -856,6 +879,7 @@ export async function evaluateFixOutcome(
     return {
       recheck,
       regressions,
+      regressionCheck,
       accepted: false,
       reason:
         'Fix ran and reported success but the issue is still present on re-check — ' +
@@ -866,20 +890,30 @@ export async function evaluateFixOutcome(
     return {
       recheck,
       regressions,
+      regressionCheck,
       accepted: false,
       reason:
         `Fix closed its own gap but broke ${regressions.length} previously passing ` +
         `guarantee(s): ${regressions.join(', ')}. Escalated instead of recorded as fixed.`,
     }
   }
+
+  const closure =
+    recheck === 'resolved'
+      ? 'Gap re-probed and confirmed closed'
+      : covered
+        ? 'Fix applied. The check that would confirm closure could not run, so closure is not confirmed'
+        : 'Fix applied. No probe covers this type, so closure could not be confirmed'
+  const collateral =
+    regressionCheck === 'ran'
+      ? ', with no regressions.'
+      : '. Other guarantees were not compared, because the state before the fix could not be captured.'
   return {
     recheck,
     regressions: [],
+    regressionCheck,
     accepted: recheck === 'resolved',
-    reason:
-      recheck === 'resolved'
-        ? 'Gap re-probed and confirmed closed, with no regressions.'
-        : 'Fix applied. No probe covers this type, so closure could not be confirmed.',
+    reason: closure + collateral,
   }
 }
 

@@ -325,6 +325,13 @@ __tests__/auth/user-delete-authorization.test.ts
 # identically against the bug.
 __tests__/services/fresh-install-auth-purge.test.ts
 
+# Every "fixed" claim comes from a recorded, re-checked outcome: /health says
+# how each finding closed and counts only confirmed repairs, POST /health only
+# dismisses, the away digest and event feed mark unconfirmed changes as such
+# and claim no rollback, and the loop's sensor record names checks that could
+# not run. Real findings, audit rows and preferences are the property.
+tests/integration/fixed-claims-from-verified-state.spec.ts
+
 # Five destructive routes that did not check who was asking. Three had NO
 # authentication at all - anyone reaching the server could roll back a live
 # deployment or rebuild a workspace database. Two verified a token and then
@@ -554,6 +561,10 @@ tests/integration/mcp-domain-operations.spec.ts
 # real executor and worker, and checks the persisted run record.
 tests/integration/sandbox-function-logs.spec.ts
 tests/integration/apply-migration-existing-table.spec.ts
+
+# Failed migration DDL preserves PostgreSQL data and stops without asking the
+# model to substitute a different action. Uses real projects, rows and catalogs.
+tests/integration/apply-migration-dispatch.spec.ts
 # MCP acceptance (scripts/mcp-acceptance/cases.ts): two agent workflows, twice
 # each, and the acceptance cases no other suite covered. Real MCP route, real
 # keys, provisioned projects, runtime engine mode.
@@ -569,6 +580,52 @@ __tests__/storage/storage-quota-follows-plan.test.ts
 # with an exactly-once id, a failed or ambiguous flush retried without double
 # counting, a SIGTERM spool replayed once, and an insert-only monthly close.
 __tests__/usage/usage-ledger.test.ts
+
+# AI spend: concurrent reservations from separate connections cannot pass a
+# monthly limit, settled and unknown spend count against it, deployment-paid
+# calls are held against both budgets, and each reservation settles once
+# (charged, released or booked as unknown), with abandoned ones expiring as
+# unknown. Row locks are the property, so it needs a real Postgres.
+tests/integration/ai-spend-ledger.spec.ts
+
+# The brain on the AI gateway, end to end with a scripted model: what each call
+# sends, every tool call answered in one turn with thinking carried back, credits
+# in cost-weighted tokens, usage rows per call, and the approval gate, cut-off,
+# deadline and no-provider paths. It reads and writes the project, its
+# workspace schema and its conversation, so it needs a real Postgres.
+tests/integration/brain-on-gateway.spec.ts
+
+# /v1/{projectId}/ai/generate: model names resolve to the deployment's aliases,
+# the output is capped, the project's credits gate and pay for it, and a provider
+# failure answers with a code and plain words. It reads the project and writes
+# its usage row, so it needs a real Postgres.
+tests/integration/runtime-generate.spec.ts
+
+# Escalated findings: the deterministic investigation first, then the model
+# investigator with real read-only probes, a checked hypothesis stored as one,
+# once per evidence, with backoff after failures. The probes read the
+# project's catalog, so it needs a real Postgres.
+tests/integration/escalation-investigation.spec.ts
+
+# The first AI repair class end to end: a lab fault, a bound proposal, a person's
+# approval of that exact version, governed execution checked three ways, Undo,
+# and the stale, double-approval, ineligible and resolve_finding guards. It
+# alters a workspace table and restores it, so it needs a real Postgres.
+tests/integration/ai-fix-proposals.spec.ts
+
+# The lab's AI arm: each fault seeded, broken, filed by its canonical detector
+# and handed to the investigator (a scripted model), measured as gates (no
+# unapproved mutation, no false "fixed", no model call on a healthy backend
+# with nothing escalated)
+# separately from utility. It seeds and alters lab schemas, so it needs a real
+# Postgres.
+tests/integration/ai-lab-arm.spec.ts
+
+# AI credit holds: a customer-paid call's worst case held on the account's usage
+# row before it is sent, one conditional update so racing calls cannot both
+# take the last credits, released on settle, stale after a crash, never a
+# charge. The row and the race are real, so it needs a real Postgres.
+tests/integration/ai-credit-holds.spec.ts
 
 # Every meter measures what lib/usage/axes.ts says: streamed egress bytes once and
 # never for internal traffic, MAU once per user per month, database size including
@@ -668,6 +725,13 @@ tests/integration/end-user-session-tokens.spec.ts
 # branch rows is the property, so it needs a real Postgres.
 tests/integration/branch-key-surfaces.spec.ts
 
+# A key is served only where it belongs: an MCP key is refused by every runtime
+# surface from anywhere, and a service-role key by every surface from a browser,
+# at both doors and again in each route's own authentication, while a key in its
+# own place still reaches its router. Real key rows and mount order are the
+# property, so it needs a real Postgres.
+tests/integration/key-placement-surfaces.spec.ts
+
 # A preview branch has a working endpoint: the agent tool issues a branch key,
 # the runtime serves the branch and tags its request log rows, every production
 # health reader ignores those rows, and the branch's OpenAPI spec reads the
@@ -690,3 +754,20 @@ tests/integration/branch-auth.spec.ts
 # the resolved (decrypted) project secret every verifier uses, and refresh binds
 # the id as the column's type, so it works on the canonical uuid users table.
 # Real provisioned projects (encrypted secrets) and real users are the property.
+
+# Whether a user's coding agent is connected: an MCP key or OAuth connection
+# their agent authenticated with (authenticateMcp's stamp), unexpired, for this
+# user and this project only, and the console status route built on it: owner
+# answered, stranger refused, revoking disconnects. Real keys and stamps.
+tests/integration/agent-connection.spec.ts
+
+# An approval runs only the exact call it recorded: a request with no stored
+# call is closed without running anything and says why, a closed request cannot
+# be approved again, and every new request stores its exact arguments. Real
+# approval rows and audit rows are the property, so it needs a real Postgres.
+tests/integration/approval-binding.spec.ts
+
+# Resetting an end user's password from an agent never changes the password and
+# never returns a credential; an unknown account is reported plainly. Real
+# workspace users tables are the property, so it needs a real Postgres.
+tests/integration/reset-password-sends-link.spec.ts

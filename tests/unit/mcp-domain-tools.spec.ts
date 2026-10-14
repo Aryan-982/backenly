@@ -210,9 +210,9 @@ describe('what a read-only key discovers', () => {
     }
   })
 
-  it('is described in the Connect guide with the counts the catalog really serves', () => {
-    const { article } = require('@/app/resources/content/connect-your-coding-agent')
-    expect(JSON.stringify(article)).toContain(`served ${ro().length} tools instead of ${buildCatalog().length}`)
+  it('is described on the Connect docs page with the counts the catalog really serves', () => {
+    const { DOCS_BY_SLUG } = require('@/app/docs/content')
+    expect(JSON.stringify(DOCS_BY_SLUG.connect)).toContain(`served ${ro().length} tools instead of ${buildCatalog().length}`)
   })
 
   it('still withholds every write-only door', () => {
@@ -361,6 +361,13 @@ describe('runApprovedCall', () => {
     const out = await runApprovedCall('delete_bucket', { bucketName: 'x' }, ctx, async () => ({ ok: false, summary: 'no such bucket' }))
     expect(out).toMatchObject({ status: 'failed' })
     expect(out.summary).toMatch(/no such bucket/)
+  })
+
+  it('never claims a failed call changed nothing, since a multi-step call can stop part-way', async () => {
+    const out = await runApprovedCall('trigger_deploy', {}, ctx, async () => ({ ok: false, summary: 'migration step failed' }))
+    expect(out.status).toBe('failed')
+    expect(out.summary).not.toMatch(/nothing was applied|unchanged/i)
+    expect(out.summary).toMatch(/read the current state/)
   })
 
   it('reports a thrown or overrunning call as failed rather than hanging', async () => {
