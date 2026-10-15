@@ -49,6 +49,14 @@ import { existingTables } from '@/lib/mcp/apply-migration'
 import { runReadQuery } from '@/lib/mcp/read-query'
 import { createBranch, discardBranch } from '@/lib/branches/engine'
 import { readWorkspaceSchema } from '@/lib/typegen/schema-reader'
+import { executeAction, introspectSchema } from '@/lib/ai/minimal-executor'
+import { logActivity } from '@/lib/ai/activity-log-engine'
+import { buildWorkspaceTableNameMap } from '@/lib/ai/fk-repair'
+import { collectProof } from '@/lib/ai/proof-system'
+import { describeTable } from '@/lib/ai/schema-tools'
+import { detectSchemaDrift } from '@/lib/ai/schema-reconciler'
+import { analyzeProductionReadiness } from '@/lib/ai/production-intelligence'
+import { runInfraIntelligence } from '@/lib/ai/infra-intelligence'
 import { directAccessRoleNames, provisionDirectAccess, revokeDirectAccess } from '@/lib/services/direct-access'
 import { columnTypes } from '@/lib/mcp/runtime-db'
 import { getTableSchema, listExposedTables, workspaceTableExists } from '@/lib/mcp/schema-introspection'
@@ -780,6 +788,133 @@ describe('type generation and preview branches use the project’s region', () =
   it('refuses without a connection to the region', async () => {
     delete process.env[REGION_VARIABLE]
     await expect(readWorkspaceSchema(regionalProject)).rejects.toMatchObject({ code: 'REGION_NOT_CONFIGURED' })
+  })
+})
+
+describe('the AI executor reads and writes the project’s region', () => {
+  const regionalColumns = (table: string) =>
+    rowsIn<{ column_name: string }>(
+      regionalUrl,
+      `SELECT column_name FROM information_schema.columns
+        WHERE table_schema = '${schemaOf(regionalProject)}' AND table_name = '${table}' ORDER BY column_name`,
+    )
+  const addColumn = (columnName: string) =>
+    executeAction(
+      { action: 'ADD_COLUMN', params: { tableName: 'marker', columnName, columnType: 'text' } } as any,
+      regionalProject,
+      undefined,
+      0,
+      undefined,
+      false,
+    )
+
+  it('describes a regional project’s schema to the AI from its region', async () => {
+    process.env[REGION_VARIABLE] = regionalUrl
+    const described = await introspectSchema(regionalProject)
+    expect(described).toContain('marker')
+    expect(described).toContain('deleted_at')
+  })
+
+  it('adds a column to a regional project’s table in its region', async () => {
+    process.env[REGION_VARIABLE] = regionalUrl
+    const result = await addColumn('tag')
+    expect(result.success).toBe(true)
+    expect((await regionalColumns('marker')).map((c) => c.column_name)).toContain('tag')
+  })
+
+  it('fails without a connection instead of reading the project as empty', async () => {
+    delete process.env[REGION_VARIABLE]
+    await expect(introspectSchema(regionalProject)).rejects.toMatchObject({ code: 'REGION_NOT_CONFIGURED' })
+    const result = await addColumn('never_added').catch((err) => ({ success: false, error: err }))
+    expect(result.success).toBe(false)
+    process.env[REGION_VARIABLE] = regionalUrl
+    expect((await regionalColumns('marker')).map((c) => c.column_name)).not.toContain('never_added')
+  })
+})
+
+describe('the AI build tools read and write the project’s region', () => {
+  const activityRows = () =>
+    rowsIn<{ entity_id: string }>(
+      regionalUrl,
+      `SELECT entity_id FROM "${schemaOf(regionalProject)}".activity_logs ORDER BY entity_id`,
+    )
+  const entry = (entityId: string) => ({
+    projectId: regionalProject,
+    action: 'created' as const,
+    entityType: 'marker',
+    entityId,
+    description: 'region test',
+  })
+
+  beforeAll(async () => {
+    await run(
+      regionalUrl,
+      `CREATE TABLE "${schemaOf(regionalProject)}".activity_logs (
+         action text, entity_type text, entity_id text, description text,
+         actor_id text, metadata jsonb, created_at timestamptz
+       )`,
+    )
+  })
+
+  it('reads a regional project’s catalog for table descriptions, FK repair and the proof block', async () => {
+    process.env[REGION_VARIABLE] = regionalUrl
+    const described = await describeTable(regionalProject, 'marker')
+    expect(described?.columns.map((c) => c.name)).toContain('deleted_at')
+    expect((await buildWorkspaceTableNameMap(regionalProject)).has('marker')).toBe(true)
+    expect((await collectProof(regionalProject)).tables).toContain('marker')
+  })
+
+  it('writes the activity log into the regional schema', async () => {
+    process.env[REGION_VARIABLE] = regionalUrl
+    await logActivity(entry('logged-in-region'))
+    expect(await activityRows()).toEqual([{ entity_id: 'logged-in-region' }])
+  })
+
+  it('refuses the readers without a connection, while activity logging stays best-effort', async () => {
+    delete process.env[REGION_VARIABLE]
+    await expect(describeTable(regionalProject, 'marker')).rejects.toMatchObject({ code: 'REGION_NOT_CONFIGURED' })
+    await expect(buildWorkspaceTableNameMap(regionalProject)).rejects.toMatchObject({ code: 'REGION_NOT_CONFIGURED' })
+    await expect(collectProof(regionalProject)).rejects.toMatchObject({ code: 'REGION_NOT_CONFIGURED' })
+    await expect(logActivity(entry('never-logged'))).resolves.toBeUndefined()
+    process.env[REGION_VARIABLE] = regionalUrl
+    expect(await activityRows()).toEqual([{ entity_id: 'logged-in-region' }])
+  })
+})
+
+describe('the AI analysis modules with their own pools read the project’s region', () => {
+  // A snapshot that expects `marker` with `note` only. Read from the region,
+  // the table is there and its regional-only `deleted_at` is an extra column;
+  // read anywhere else, `marker` would be a missing table.
+  beforeAll(async () => {
+    await prisma.workspaceSchemaSnapshot.create({
+      data: {
+        projectId: regionalProject,
+        versionNum: 1,
+        trigger: 'manual',
+        rawDdl: '',
+        tables: [{ name: 'marker', columns: [{ name: 'note', type: 'text', nullable: true }] }],
+      },
+    })
+  })
+
+  afterAll(async () => {
+    await prisma.workspaceSchemaSnapshot.deleteMany({ where: { projectId: regionalProject } }).catch(() => {})
+  })
+
+  it('reconciles a regional project’s schema against its regional catalog', async () => {
+    process.env[REGION_VARIABLE] = regionalUrl
+    const report = await detectSchemaDrift(regionalProject)
+    expect(report.drifts.filter((d) => d.type === 'missing_table')).toEqual([])
+    expect(
+      report.drifts.some((d) => d.type === 'extra_column' && d.tableName === 'marker' && d.columnName === 'deleted_at'),
+    ).toBe(true)
+  })
+
+  it('refuses without a connection instead of reporting a clean or empty result', async () => {
+    delete process.env[REGION_VARIABLE]
+    await expect(detectSchemaDrift(regionalProject)).rejects.toMatchObject({ code: 'REGION_NOT_CONFIGURED' })
+    await expect(analyzeProductionReadiness(regionalProject)).rejects.toMatchObject({ code: 'REGION_NOT_CONFIGURED' })
+    await expect(runInfraIntelligence(regionalProject)).rejects.toMatchObject({ code: 'REGION_NOT_CONFIGURED' })
   })
 })
 
