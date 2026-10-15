@@ -171,6 +171,14 @@ __tests__/database/schema-version-snapshots.test.ts
 # serving the union of both stores with working filters and DB-side counts.
 __tests__/monitoring/monitoring-truth.test.ts
 
+# Trigger webhooks fired a RAW fetch on the stored URL from the web process and
+# persisted the failure text — an SSRF primitive with a persistence layer,
+# readable back over MCP — while endpoint webhooks had already moved to
+# safeFetch. And syncWebhookCapture's "after a table is added" contract had no
+# caller on any creation path, so webhooks never saw rows in newer tables.
+# Pins guard-validated creation, guarded delivery (raw fetch never touched),
+# the capped stored failure, and the capture sync on CREATE_TABLE.
+__tests__/services/trigger-webhook-egress.test.ts
 
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
