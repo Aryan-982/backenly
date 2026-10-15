@@ -92,6 +92,7 @@ import { runBackfillBatch } from '@/lib/autonomy/maintenance/primitives/backfill
 import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { measureProjectDbBytes, snapshotProjectDbStorage } from '@/lib/usage/db-storage'
 
 // workspace-backup reads BACKUP_DIR when it loads, so it is pinned here and the
 // module is only loaded lazily, in the backup block below.
@@ -1328,6 +1329,27 @@ describe('backups, restores and archive cleanup use the project’s region', () 
 
     await oldArchive('marker__archived__2')
     await expect(archives.cleanupOldArchives(regionalProject)).rejects.toMatchObject(refused)
+  })
+})
+
+describe('storage is measured in the project’s region', () => {
+  afterAll(async () => {
+    await prisma.projectUsage.deleteMany({ where: { projectId: regionalProject } })
+  })
+
+  it('measures the regional schemas, and records nothing it could not measure', async () => {
+    // Read from the home database the schema is absent: 0 bytes, recorded as
+    // the project's size for the quota check and for billing.
+    delete process.env[REGION_VARIABLE]
+    await expect(measureProjectDbBytes(regionalProject)).rejects.toMatchObject({ code: 'REGION_NOT_CONFIGURED' })
+    await snapshotProjectDbStorage(regionalProject)
+    expect(await prisma.projectUsage.count({ where: { projectId: regionalProject } })).toBe(0)
+
+    process.env[REGION_VARIABLE] = regionalUrl
+    expect(await measureProjectDbBytes(regionalProject)).toBeGreaterThan(BigInt(0))
+    await snapshotProjectDbStorage(regionalProject)
+    const usage = await prisma.projectUsage.findFirst({ where: { projectId: regionalProject } })
+    expect(usage?.dbStorageUsedMb ?? 0).toBeGreaterThan(0)
   })
 })
 
