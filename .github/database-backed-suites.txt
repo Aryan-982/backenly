@@ -179,6 +179,14 @@ __tests__/monitoring/monitoring-truth.test.ts
 # Pins guard-validated creation, guarded delivery (raw fetch never touched),
 # the capped stored failure, and the capture sync on CREATE_TABLE.
 __tests__/services/trigger-webhook-egress.test.ts
+# ApiKey.permissions was written by set_key_permissions and the key editor but
+# never read by the data plane: /api/v1 db and /api/v2 served writes to any
+# valid key, so narrowing a leaked key to ['read'] changed nothing while the
+# tool answered "permissions updated". Pins the method gate on BOTH doors
+# (read-only refused on writes with INSUFFICIENT_KEY_PERMISSIONS, read+write
+# and service-role unaffected) and that SET_KEY_PERMISSIONS over the real
+# executor takes effect on the very next request. Real server, real socket.
+tests/integration/key-permission-gate.spec.ts
 
 # Single-tenant bootstrap (commit 3). Runs the real script against a database it
 # creates and drops, because everything worth asserting is a side effect on
