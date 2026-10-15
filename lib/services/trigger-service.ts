@@ -14,6 +14,7 @@
  */
 
 import { prisma } from '@/lib/db'
+import { workspaceRawClient } from '@/lib/data-plane/regional'
 import * as Sentry from '@sentry/nextjs'
 import crypto from 'crypto'
 
@@ -323,16 +324,29 @@ async function executeWebhookRequest(
     headers['X-Backenly-Signature'] = `sha256=${signature}`
   }
 
-  const response = await fetch(trigger.webhookUrl, {
+  // safeFetch, NOT fetch — the same guard endpoint webhooks already deliver
+  // through (lib/webhooks/index.ts). A raw fetch on a stored URL from the web
+  // process is a server-side request forgery primitive with a persistence
+  // layer: the failure text below lands in TriggerDeliveryLog.error, which the
+  // agent reads back via webhooks {trigger_deliveries} — loopback services,
+  // the VPC and 169.254.169.254 included. The guard validates scheme and
+  // address at connect time, re-validates every redirect hop, and caps the
+  // response size.
+  const { safeFetch } = await import('@/lib/security/outbound-guard')
+  const response = await safeFetch(trigger.webhookUrl, {
     method: 'POST',
+    egressScope: 'webhook',
     headers,
     body,
-    signal: AbortSignal.timeout(30_000), // 30s timeout
+    timeoutMs: 30_000,
+    maxBytes: 64 * 1024,
   })
 
   if (!response.ok) {
     const text = await response.text().catch(() => '')
-    throw new Error(`Webhook returned ${response.status}: ${text}`)
+    // Diagnostic only, and served back to every reader of the delivery log:
+    // capped so a receiver cannot park kilobytes of its choosing there.
+    throw new Error(`Webhook returned ${response.status}: ${String(text).slice(0, 300)}`)
   }
 
   return { statusCode: response.status }
@@ -413,7 +427,9 @@ async function executeInsertRow(
     VALUES (${placeholders})
   `
 
-  await prisma.$executeRawUnsafe(sql, ...values)
+  // On the database holding the project's data, in its region.
+  const db = await workspaceRawClient(projectId)
+  await db.$executeRawUnsafe(sql, ...values)
 
   console.log(`[Triggers] ✅ Inserted row into "${trigger.targetTable}" via trigger "${trigger.name}"`)
 
@@ -467,7 +483,9 @@ async function executeUpdateRow(
     WHERE ${whereClauses.join(' AND ')}
   `
 
-  await prisma.$executeRawUnsafe(sql, ...setValues, ...whereValues)
+  // On the database holding the project's data, in its region.
+  const db = await workspaceRawClient(projectId)
+  await db.$executeRawUnsafe(sql, ...setValues, ...whereValues)
 
   console.log(`[Triggers] ✅ Updated rows in "${trigger.targetTable}" via trigger "${trigger.name}"`)
 
@@ -509,7 +527,9 @@ async function executeDeleteRows(
     WHERE ${whereClauses.join(' AND ')}
   `
 
-  await prisma.$executeRawUnsafe(sql, ...values)
+  // On the database holding the project's data, in its region.
+  const db = await workspaceRawClient(projectId)
+  await db.$executeRawUnsafe(sql, ...values)
 
   console.log(`[Triggers] ✅ Deleted rows from "${trigger.targetTable}" via trigger "${trigger.name}"`)
 
@@ -538,6 +558,15 @@ export async function createTrigger(
     webhookUrl?: string
   }
 ): Promise<{ id: string; name: string }> {
+  // A stored URL is a standing instruction to the delivery worker. Refusing a
+  // blocked destination here answers the creator with the reason, instead of
+  // parking a trigger that fails on every fire; delivery still re-validates,
+  // because a hostname that is public today can point somewhere else tomorrow.
+  if (params.webhookUrl) {
+    const { assertAllowedUrl } = await import('@/lib/security/outbound-guard')
+    assertAllowedUrl(params.webhookUrl, 'webhook')
+  }
+
   const trigger = await prisma.appTrigger.create({
     data: {
       projectId,
@@ -571,6 +600,9 @@ export async function listTriggers(projectId: string) {
       event: true,
       actionType: true,
       targetTable: true,
+      // The destination a webhook trigger posts to — the console renders it.
+      // webhookSecret is deliberately NOT selected: it never leaves the server.
+      webhookUrl: true,
       enabled: true,
       createdAt: true,
     },
