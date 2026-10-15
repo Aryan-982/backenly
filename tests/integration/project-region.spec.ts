@@ -86,6 +86,9 @@ import { pruneDanglingSchemas } from '@/lib/postgrest/health'
 import { healDataPlane } from '@/lib/postgrest/supervisor'
 import { applyRemedy } from '@/lib/autonomy/hypothesis/remedy'
 import { PROBE_REGISTRY } from '@/lib/autonomy/hypothesis/probes'
+import { executeMaintenanceAddStructure } from '@/lib/autonomy/maintenance/primitives/add-structure'
+import { dualWriteInstalled, installDualWrite, removeDualWrite } from '@/lib/autonomy/maintenance/primitives/dual-write'
+import { runBackfillBatch } from '@/lib/autonomy/maintenance/primitives/backfill'
 
 jest.setTimeout(120_000)
 
@@ -1179,6 +1182,58 @@ describe('each region’s data plane is checked and healed on its own', () => {
       hypothesis: { id: 'h', statement: 's', prior: 1, predicts: {}, remedy: { summary: 'reload', autoApplicable: true, action: 'POSTGREST_RELOAD_SCHEMA' } },
     } as unknown as Parameters<typeof applyRemedy>[1]
     await expect(applyRemedy(regionalProject, verdict)).rejects.toMatchObject(refused)
+  })
+})
+
+describe('the maintenance primitives act on the project’s region', () => {
+  // `ledger` exists only in the regional database. Read from the home one, every
+  // primitive below would see no table at all.
+  const ledger = () => `"${schemaOf(regionalProject)}".ledger`
+  const upper = { kind: 'upper' } as const
+  // A function: regionalProject is only assigned in the top-level beforeAll.
+  const spec = () => ({ projectId: regionalProject, table: 'ledger', sourceColumn: 'status', targetColumn: 'state', transform: upper })
+
+  beforeAll(async () => {
+    await run(
+      regionalUrl,
+      `CREATE TABLE ${ledger()} (id int PRIMARY KEY, status text, state text);
+       INSERT INTO ${ledger()} VALUES (1, 'open', NULL), (2, 'shut', NULL)`,
+    )
+  })
+
+  afterAll(async () => {
+    await run(regionalUrl, `DROP TABLE IF EXISTS ${ledger()} CASCADE`).catch(() => {})
+  })
+
+  it('reads the regional catalog before it acts, and acts there', async () => {
+    process.env[REGION_VARIABLE] = regionalUrl
+
+    // The column add_structure would add is already on the regional table.
+    expect(
+      await executeMaintenanceAddStructure({ projectId: regionalProject, table: 'ledger', column: 'status', columnType: 'text' }),
+    ).toMatchObject({ added: false, refusal: expect.stringMatching(/already exists/) })
+
+    const dualWrite = await installDualWrite(spec())
+    expect(dualWrite).toMatchObject({ installed: true, refusal: null })
+    expect(await dualWriteInstalled(regionalProject, 'ledger', dualWrite.objectName)).toBe(true)
+
+    expect(await runBackfillBatch(spec(), null)).toMatchObject({ refusal: null, scanned: 2, updated: 2, done: true })
+    expect(await rowsIn(regionalUrl, `SELECT state FROM ${ledger()} ORDER BY id`)).toEqual([{ state: 'OPEN' }, { state: 'SHUT' }])
+
+    expect(await removeDualWrite(regionalProject, 'ledger', 'state')).toMatchObject({ removed: true })
+    expect(await dualWriteInstalled(regionalProject, 'ledger', dualWrite.objectName)).toBe(false)
+  })
+
+  it('refuses without a connection to the region, and never reports a removal it could not confirm', async () => {
+    delete process.env[REGION_VARIABLE]
+    const refused = { code: 'REGION_NOT_CONFIGURED' }
+    await expect(dualWriteInstalled(regionalProject, 'ledger', 'bkn_dw_ledger_state')).rejects.toMatchObject(refused)
+    expect(await removeDualWrite(regionalProject, 'ledger', 'state')).toMatchObject({ removed: false })
+    await expect(installDualWrite(spec())).rejects.toMatchObject(refused)
+    await expect(runBackfillBatch(spec(), null)).rejects.toMatchObject(refused)
+    await expect(
+      executeMaintenanceAddStructure({ projectId: regionalProject, table: 'ledger', column: 'extra', columnType: 'text' }),
+    ).rejects.toMatchObject(refused)
   })
 })
 
