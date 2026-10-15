@@ -176,6 +176,20 @@ describe('a turn on the gateway', () => {
     )
   }, 60_000)
 
+  it('does not present an MCP caller as dashboard page context', async () => {
+    const provider = scriptedProvider([
+      classified('QUESTION'),
+      scriptedMessage({
+        toolUse: [{ id: 'toolu_finish', name: 'finish', input: { summary: 'No page context.' } }],
+      }),
+    ])
+
+    await turn(provider, 'what can I do here?', { door: 'mcp' })
+
+    const system = provider.calls[1].params.system as Anthropic.TextBlockParam[]
+    expect(system.map((block) => block.text).join('\n')).not.toContain("USER'S CURRENT PAGE")
+  }, 60_000)
+
   it('stops a destructive call at the approval gate, answers it as an error, and returns it to queue', async () => {
     const provider = scriptedProvider([
       classified('DESTRUCTIVE'),
