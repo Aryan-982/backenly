@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { clientIpFromHeaders } from '@/lib/security/client-ip'
 import { authenticateApiKey } from '@/lib/middleware/apiKeyAuth'
 import { prisma } from '@/lib/db'
+import { workspaceRawClient } from '@/lib/data-plane/regional'
 import { createErrorResponse, ErrorCodes } from './errors'
 import { checkUsage, getUsageMessage } from '@/lib/scaling/usage-monitor'
 import { applySoftRateLimit } from '@/lib/scaling/usage-monitor'
@@ -461,6 +462,12 @@ export async function v1ApiMiddleware(
       }
       // Accept only project-scoped tokens issued for THIS project
       if (payload?.projectId === projectId && payload.userId) {
+        // The blacklist and the users table are in the project's database, in
+        // its region. Resolved before the fail-open checks below, which accept
+        // a token whose status cannot be read: for a region this process cannot
+        // reach that would honour every revoked and blocked token, so the
+        // error fails the request instead.
+        const db = await workspaceRawClient(projectId)
         // Reject tokens that have been explicitly revoked via /auth/logout.
         // The blacklist table is created lazily — skip the check gracefully if
         // it does not yet exist (i.e. no user has ever logged out from this project).
@@ -468,13 +475,52 @@ export async function v1ApiMiddleware(
         if (payload.jti) {
           try {
             const schemaName = `workspace_${projectId}`
-            const rows = await prisma.$queryRawUnsafe<{ jti: string }[]>(
+            const rows = await db.$queryRawUnsafe<{ jti: string }[]>(
               `SELECT jti FROM "${schemaName}"."_token_blacklist" WHERE jti = $1 LIMIT 1`,
               payload.jti
             )
             blacklisted = rows.length > 0
           } catch {
             // Table doesn't exist yet — treat as not blacklisted
+          }
+        }
+
+        // Blocking promises "existing JWT tokens stop working immediately" —
+        // true only if request time checks it. Before this, is_blocked was
+        // read at sign-in and refresh alone, so a blocked user's live token
+        // kept serving data for up to seven days. A missing table or column
+        // means nobody was ever blocked; other failures fail open, loudly,
+        // like the revocation check above.
+        let blocked = false
+        if (!blacklisted) {
+          try {
+            const schemaName = `workspace_${projectId}`
+            const rows = await db.$queryRawUnsafe<{ is_blocked: boolean | null }[]>(
+              `SELECT is_blocked FROM "${schemaName}"."users" WHERE id::text = $1 LIMIT 1`,
+              String(payload.userId)
+            )
+            blocked = rows[0]?.is_blocked === true
+          } catch (err: any) {
+            const text = String(err?.message ?? err)
+            const absent =
+              err?.code === '42P01' || err?.code === '42703' || text.includes('42P01') || text.includes('42703')
+            if (!absent) {
+              console.error(
+                `[V1Middleware] is_blocked check FAILED OPEN for project ${projectId}: ${text}. ` +
+                `A blocked user's token would have been accepted.`
+              )
+            }
+          }
+        }
+
+        if (blocked) {
+          return {
+            context: {} as V1ApiContext,
+            response: createErrorResponse(
+              ErrorCodes.FORBIDDEN,
+              'This account has been blocked by the project owner.',
+              403
+            ),
           }
         }
 

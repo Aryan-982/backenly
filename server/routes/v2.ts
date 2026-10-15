@@ -46,9 +46,10 @@ import {
   profileForProject,
 } from '@/lib/postgrest/gateway'
 import { checkExposure, type Operation } from '@/lib/postgrest/exposure'
+import { projectPostgrest } from '@/lib/data-plane/regional'
 import { stripUpstreamError } from '@/lib/postgrest/translate'
 import { ensureSchemaRegistered } from '@/lib/postgrest/registration'
-import { getProjectIdFromAuth } from './dynamic'
+import { getProjectIdFromAuth, refuseIfKeyLacksMethodPermission } from './dynamic'
 import { ENVIRONMENT_HEADER, environmentHeaderValue } from '@/lib/branches/key-scope'
 import { isKeyPlacementRefusal } from '@/lib/security/key-placement'
 import { enforceRateLimitByKeyId } from '../lib/auth'
@@ -85,11 +86,6 @@ router.all('/:projectId/*', asyncRoute(async (req: Request, res: Response) => {
     return res.status(404).json({ code: 'NOT_FOUND', message: 'No table in path.' })
   }
 
-  const baseUrl = process.env.POSTGREST_URL
-  const secret = process.env.POSTGREST_JWT_SECRET
-  if (!baseUrl || !secret) {
-    return res.status(503).json({ code: 'V2_UNAVAILABLE', message: 'PostgREST is not configured.' })
-  }
 
   // No per-project engine gate. This check existed while two data planes
   // coexisted: answering v2 for a project still served by the legacy executor
@@ -146,6 +142,22 @@ router.all('/:projectId/*', asyncRoute(async (req: Request, res: Response) => {
       })
     }
   }
+
+  // The key's own permission set gates the method — the same rule the legacy
+  // /db door applies, so narrowing a key narrows it on EVERY data door.
+  if (refuseIfKeyLacksMethodPermission(req, res, auth)) return
+
+  // Deployment configuration is judged AFTER the credential: a self-host
+  // without PostgREST still answers a bad key with the refusal it deserves,
+  // not with a 503 that hides the authorization result.
+  //
+  // The PostgREST serving the project's region; never another region's, which
+  // serves a database without this project's schema.
+  const postgrest = await projectPostgrest(projectId)
+  if (!postgrest) {
+    return res.status(503).json({ code: 'V2_UNAVAILABLE', message: 'PostgREST is not configured.' })
+  }
+  const { url: baseUrl, jwtSecret: secret } = postgrest
 
   // Authenticated, in quota, and past the serving gate: real use.
   void touchProjectActivity(projectId)

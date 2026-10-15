@@ -250,7 +250,7 @@ export default function PublishPage() {
   if (loading) {
     return (
       <div className={`${PAGE_WIDTH} ${PAGE_GUTTER} pb-16`}>
-        <PageHeader className="!px-0" title="Deploy" description="Production changes only when you publish." />
+        <PageHeader className="!px-0" title="Deploy" description="Publishing records a version of your backend. The API serves changes as they are made." />
         <div className="space-y-4" aria-hidden>
           <Skeleton className="h-[76px] w-full rounded-[10px]" />
           <Skeleton className="h-[200px] w-full rounded-[10px]" />
@@ -279,6 +279,11 @@ export default function PublishPage() {
   const endpointCount = backendState?.endpointCount ?? (backendState?.apis.length ?? 0) * 5
   const tableCount = backendState?.entities.length ?? 0
   const apiResourceCount = backendState?.apis.length ?? 0
+  // What the publish ENGINE will accept (lib/deployment/go-live.ts refuses
+  // when tables, exposed APIs and auth are all absent). hasContent is wider —
+  // functions, buckets or realtime alone flip it — and offering Publish on
+  // that wider set meant the button led straight to a refusal.
+  const publishable = tableCount > 0 || apiResourceCount > 0 || hasAuth
 
   const passingChecks = readinessChecks.filter(c => c.status === 'pass').length
   const blockingChecks = readinessChecks.filter(c => c.status === 'fail' && c.severity === 'blocking')
@@ -310,13 +315,13 @@ export default function PublishPage() {
   })()
 
   const runtimeTagline = (() => {
-    if (status === 'LIVE' && hasRealBackend) return 'Your production endpoint is serving. Every change is governed, snapshotted and reversible.'
-    if (status === 'DEPLOYING') return 'Creating a stable production snapshot. The runtime stays locked until activation completes.'
-    if (status === 'FAILED') return 'The last publish failed. Production is unchanged, and the previous version is still serving.'
-    if (hasRealBackend) return 'Your backend is built. Publish it to get a stable, versioned endpoint your app can rely on.'
+    if (status === 'LIVE' && hasRealBackend) return 'Your endpoint is serving. Every change is governed and recorded; publishing snapshots a version you can compare and report against.'
+    if (status === 'DEPLOYING') return 'Recording a versioned snapshot of the backend. The API keeps serving while it completes.'
+    if (status === 'FAILED') return 'The last publish failed, so no new version was recorded. The API keeps serving the backend as it is.'
+    if (hasRealBackend) return 'Your backend is built and its API is already answering. Publish to record version one and mark the project live.'
     return agent.connected
-      ? 'Production changes only when you publish. Ask your agent to start building.'
-      : 'Production changes only when you publish. Connect your coding agent to start building.'
+      ? 'The API serves changes as your agent makes them. Ask your agent to start building.'
+      : 'The API serves changes as they are made. Connect your coding agent to start building.'
   })()
 
   const publishButton = (label: string) => (
@@ -595,8 +600,12 @@ export default function PublishPage() {
           <KitColumns
             main={
               <SettingsCard
-                title="Ready to go live"
-                description="Publishing snapshots the backend as version one and gives your app a stable endpoint. Later changes stay in development until you publish again."
+                title={publishable ? 'Ready to go live' : 'Serving, not yet publishable'}
+                description={
+                  publishable
+                    ? 'Publishing snapshots the backend as version one and marks the project live. The API is already answering, and keeps serving later changes as they are made; publish again to record the next version.'
+                    : 'Functions, storage and realtime are already serving. Publishing records a schema snapshot, so it needs at least one table, a generated API or enabled auth first.'
+                }
                 footer={
                   <span className="flex flex-wrap items-center gap-x-4 gap-y-1 tabular-nums">
                     {tableCount > 0 && <span>{tableCount} {tableCount === 1 ? 'table' : 'tables'}</span>}
@@ -605,7 +614,7 @@ export default function PublishPage() {
                     {hasStorage && <span>Storage</span>}
                   </span>
                 }
-                actions={publishButton('Publish backend')}
+                actions={publishable ? publishButton('Publish backend') : undefined}
               />
             }
             side={readinessPanel('Before you publish')}
@@ -643,7 +652,7 @@ export default function PublishPage() {
             <EmptyState
               icon={AlertCircle}
               title="The publish did not complete"
-              description={project.deploymentError || 'Production is unchanged and the previous version is still serving. Try again, or ask your agent to look at the error.'}
+              description={project.deploymentError || 'No new version was recorded; the API keeps serving the backend as it is. Try again, or ask your agent to look at the error.'}
               action={publishButton('Try again')}
             />
           </KitCard>

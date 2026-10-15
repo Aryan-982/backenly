@@ -11,6 +11,7 @@
 import crypto from 'crypto'
 import { verify } from 'jsonwebtoken'
 import { prisma } from '@/lib/db'
+import { workspaceRawClient } from '@/lib/data-plane/regional'
 import { resolveJwtSecret } from '@/lib/services/jwtSecretManager'
 import { noteEndUserActivity } from '@/lib/quota/kernel'
 import { crossEnvironmentToken, endUserTokenSecret } from '@/lib/branches/auth-environment'
@@ -45,7 +46,7 @@ export async function resolveEndUserFromToken(
   projectId: string,
   rawTokenInput: string | undefined,
   branch: EndUserBranch | null = null,
-): Promise<EndUserIdentity | null> {
+): Promise<EndUserIdentity | 'blocked' | null> {
   if (!rawTokenInput) return null
   const rawToken = bareToken(rawTokenInput)
   const project = await prisma.project.findUnique({
@@ -61,11 +62,17 @@ export async function resolveEndUserFromToken(
   }
   if (payload?.projectId !== projectId || !payload.userId) return null
   if ((payload.br ?? null) !== (branch?.id ?? null)) return null
+  // The blacklist and the users table are in the project's database, in its
+  // region. Resolved before the fail-open checks below: they accept a token
+  // when its status cannot be read, which for a region this process cannot
+  // reach would honour every revoked and blocked token. The error fails the
+  // request instead.
+  const db = await workspaceRawClient(projectId)
   // Honour /auth/logout revocations.
   if (payload.jti) {
     try {
       const schemaName = branch?.schemaName ?? `workspace_${projectId}`
-      const rows = await prisma.$queryRawUnsafe<{ jti: string }[]>(
+      const rows = await db.$queryRawUnsafe<{ jti: string }[]>(
         `SELECT jti FROM "${schemaName}"."_token_blacklist" WHERE jti = $1 LIMIT 1`,
         payload.jti,
       )
@@ -94,6 +101,32 @@ export async function resolveEndUserFromToken(
           `A revoked token would have been accepted.`,
         )
       }
+    }
+  }
+  // Blocking promises "existing JWT tokens stop working immediately"
+  // (block_end_user's description and its success message) — which is only
+  // true if request-time resolution checks it. Before this check, is_blocked
+  // was read at sign-in and refresh alone, so a blocked user's live token
+  // kept working for up to seven days. A missing table or column means
+  // nobody was ever blocked; any other failure fails open like the
+  // revocation check above, and just as loudly.
+  try {
+    const schemaName = branch?.schemaName ?? `workspace_${projectId}`
+    const rows = await db.$queryRawUnsafe<{ is_blocked: boolean | null }[]>(
+      `SELECT is_blocked FROM "${schemaName}"."users" WHERE id::text = $1 LIMIT 1`,
+      String(payload.userId),
+    )
+    // 'blocked', not null: the caller answers 403 — the promised behavior —
+    // instead of silently serving the request as an anonymous caller.
+    if (rows[0]?.is_blocked === true) return 'blocked'
+  } catch (err: any) {
+    const text = String(err?.message ?? err)
+    const absent = err?.code === '42P01' || err?.code === '42703' || text.includes('42P01') || text.includes('42703')
+    if (!absent) {
+      console.error(
+        `[EndUserIdentity] is_blocked check FAILED OPEN for project ${projectId}: ${text}. ` +
+        `A blocked user's token would have been accepted.`,
+      )
     }
   }
   // An authenticated data request is use: count the end user active this month

@@ -1,4 +1,6 @@
 import { prisma } from '@/lib/db'
+import { redactSecretParams } from '@/lib/mcp/withhold-secrets'
+import { sealParams } from '@/lib/operational-memory/sealed-params'
 import type { ExecutionChange } from '@/lib/orchestration/atomic-executor'
 import { recordPattern, resolveProjectType, patternTypeForEventType } from '@/lib/patterns/cross-project-learning'
 
@@ -549,6 +551,10 @@ const MEDIUM_RISK_EXECUTOR_ACTIONS = new Set([
   'DELETE_CRON_JOB', 'REMOVE_INTEGRATION_KEY', 'BLOCK_USER',
   'REMOVE_PERMISSION', 'DISABLE_REALTIME', 'DISABLE_PROVIDER',
   'TRIGGER_DEPLOY', 'SET_ENV_VAR', 'RESET_PASSWORD',
+  // Rewrites what a live credential may do. Escalation to 'admin' is refused
+  // outright in the executor; the remaining edits still reshape a key other
+  // clients hold, which is the same band as rotating one.
+  'SET_KEY_PERMISSIONS',
 ])
 
 export function riskLevelForExecutorAction(action: string): BackendRiskLevel {
@@ -650,7 +656,12 @@ export async function queuePendingActionFinding(input: QueuePendingActionInput) 
         location: input.target,
         source: input.source,
         executorAction: input.action,
-        executorParams: input.params,
+        // Display copy only: secret-named values are redacted because this row
+        // is served (health endpoint, trust report, Review Queue card,
+        // get_autonomy_status — read-only MCP keys included). Approval replays
+        // from the sealed copy, so nothing the agent sent is lost.
+        executorParams: redactSecretParams(input.params),
+        executorParamsSealed: sealParams((input.params ?? {}) as Record<string, unknown>),
         backendEventId,
       } as any,
     },
