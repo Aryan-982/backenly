@@ -25,6 +25,7 @@
 
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3'
 import { UploadRejectedError, assertFileAllowed, assertFileSize, uploadExtension } from '@/lib/storage/upload-policy'
+import { clampIsPublic, policyAllowsPublic } from '@/lib/storage/access-policy'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { prisma } from '@/lib/db'
 import crypto from 'crypto'
@@ -149,6 +150,10 @@ export class S3StorageService implements StorageService {
         name,
         projectId,
         isPublic,
+        // The enforced field. Serving (mayRead), upload clamping and the
+        // console all read accessPolicy; isPublic alone is a label. Deriving
+        // it here keeps the two in agreement from birth.
+        accessPolicy: isPublic ? 'public_read' : 'private',
       },
     })
 
@@ -182,6 +187,9 @@ export class S3StorageService implements StorageService {
       id: bucket.id,
       name: bucket.name,
       isPublic: bucket.isPublic,
+      // The enforced visibility. isPublic is a label; readers deciding what to
+      // DISPLAY or PROMISE must use this.
+      accessPolicy: bucket.accessPolicy,
       fileCount: bucket.files.length,
       totalSize: bucket.files.reduce((sum, file) => sum + file.size, BigInt(0)), // Keep as BigInt
     }))
@@ -256,6 +264,7 @@ export class S3StorageService implements StorageService {
         name: true,
         projectId: true,
         isPublic: true,
+        accessPolicy: true,
         allowedMimeTypes: true,
         allowedExtensions: true,
         blockExecutables: true,
@@ -433,7 +442,15 @@ export class S3StorageService implements StorageService {
           path: s3Key, // S3 key is stored as path
           size: BigInt(file.buffer.length),
           mimeType: detectedMimeType || null,
-          isPublic: options?.isPublic ?? bucket.isPublic,
+          // The bucket's policy is the ceiling at WRITE time, exactly as in
+          // the local driver: a caller-supplied `true` must not plant a
+          // world-readable row in a private bucket and leave the serving
+          // path to quietly clean up after it. This driver is the one Cloud
+          // runs, and it was the only writer without the clamp.
+          isPublic: clampIsPublic(
+            options?.isPublic,
+            bucket.accessPolicy ?? (bucket.isPublic ? 'public_read' : 'private'),
+          ),
           projectId: options.projectId,
           uploadedBy: options?.uploadedBy || null,
         },
@@ -500,11 +517,26 @@ export class S3StorageService implements StorageService {
         size: file.size, // Keep as BigInt
         mimeType: file.mimeType,
         isPublic: file.isPublic,
+        uploadedBy: file.uploadedBy ?? null,
         bucket: file.bucket.name,
         createdAt: file.createdAt,
         url: await this.getFileUrl(file.id, projectId, 3600),
       }))
     )
+  }
+
+  /**
+   * How many active files match — the same WHERE as listFiles. Counts the
+   * metadata DB, not S3, so it is cheap and identical across blob drivers.
+   */
+  async countFiles(bucketId: string | undefined, projectId: string, search?: string): Promise<number> {
+    if (!projectId) {
+      throw new Error('Project ID is required for tenant isolation')
+    }
+    const where: any = { projectId, deletedAt: null }
+    if (bucketId) where.bucketId = bucketId
+    if (search) where.name = { contains: search, mode: 'insensitive' }
+    return prisma.storageFile.count({ where })
   }
 
   async getFile(fileId: string, projectId: string) {
@@ -557,6 +589,7 @@ export class S3StorageService implements StorageService {
 
     const file = await prisma.storageFile.findUnique({
       where: { id: fileId },
+      include: { bucket: { select: { accessPolicy: true } } },
     })
 
     if (!file || file.deletedAt) {
@@ -573,7 +606,13 @@ export class S3StorageService implements StorageService {
     // access), so a direct `{endpoint}/{bucket}/{key}` URL returns 401. Only a
     // genuine CDN/public host (different from the S3 API endpoint) can serve the
     // object directly.
-    if (file.isPublic) {
+    //
+    // "Public" is the download route's rule (mayRead): the bucket's CURRENT
+    // policy must permit public objects AND the file must be marked public. The
+    // file's flag alone outlives a bucket tightened to private, and a permanent
+    // public URL for such a file is one the route refuses (or, via a public
+    // CDN host, one that serves what the owner made private).
+    if (policyAllowsPublic(file.bucket.accessPolicy) && file.isPublic) {
       // A SIGNED CDN serves nothing unsigned, so a public file's permanent URL
       // is the app route, which mints a fresh signed URL on every request.
       const cdnBase = signedCdnConfig() ? null : this.publicCdnBase()

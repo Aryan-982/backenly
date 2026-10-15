@@ -31,6 +31,7 @@
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db/prisma'
 import { dispatchTool, type ToolDispatchContext, type ToolResult } from '@/lib/ai/brain/tools'
+import { withholdSecrets } from '@/lib/mcp/withhold-secrets'
 
 export const APPROVAL_TTL_MS = 24 * 60 * 60 * 1000
 
@@ -125,10 +126,42 @@ export type ApprovalStatus =
   | 'failed'
   | 'partial'
 
-/** Lazily expire on read — no cron needed for correctness. */
-function effectiveStatus(row: { status: string; expiresAt: Date }): string {
-  if (row.status === 'pending' && row.expiresAt < new Date()) return 'expired'
-  return row.status
+/**
+ * Grace past EXECUTE_CAP_MS before an 'approved' row is presumed dead. The cap
+ * bounds runApprovedCall itself, so a row still 'approved' this long after the
+ * decision means the terminal update never ran — a crash or restart mid-run.
+ */
+const STUCK_APPROVED_GRACE_MS = 2 * 60 * 1000
+
+const STUCK_APPROVED_SUMMARY =
+  'Execution never reported back within its ten-minute cap — the server likely ' +
+  'restarted mid-run. The outcome is unknown: the operation may have fully or ' +
+  'partially applied. Check the change history before asking the agent to retry.'
+
+/**
+ * Lazily resolve what a row IS on read — no cron needed for correctness.
+ * 'pending' past its TTL is expired. 'approved' is a moment, not a resting
+ * state: decideApproval writes the terminal status when runApprovedCall
+ * returns, so a row stuck there past cap+grace is reported as failed with an
+ * honest summary instead of telling the agent to keep polling forever.
+ */
+function effectiveView(row: {
+  status: string
+  expiresAt: Date
+  decidedAt: Date | null
+  resultSummary: string | null
+}): { status: string; resultSummary: string | null } {
+  if (row.status === 'pending' && row.expiresAt < new Date()) {
+    return { status: 'expired', resultSummary: row.resultSummary }
+  }
+  if (
+    row.status === 'approved' &&
+    row.decidedAt &&
+    Date.now() - row.decidedAt.getTime() > EXECUTE_CAP_MS + STUCK_APPROVED_GRACE_MS
+  ) {
+    return { status: 'failed', resultSummary: row.resultSummary ?? STUCK_APPROVED_SUMMARY }
+  }
+  return { status: row.status, resultSummary: row.resultSummary }
 }
 
 /** Poll shape returned to the agent — never leaks approver identity. */
@@ -137,14 +170,50 @@ export async function getApprovalForProject(projectId: string, id: string) {
     where: { id, projectId },
   })
   if (!row) return null
+  const view = effectiveView(row)
   return {
     id: row.id,
-    status: effectiveStatus(row),
+    status: view.status,
     tool: row.tool,
     target: row.target,
     createdAt: row.createdAt.toISOString(),
     expiresAt: row.expiresAt.toISOString(),
-    resultSummary: row.resultSummary,
+    resultSummary: view.resultSummary,
+  }
+}
+
+/**
+ * The other kind of parked request: an executor-gated medium/high action the
+ * chat door queued as an `ai_action_pending` HealthFinding (Review Queue,
+ * Autonomy page). check_approval resolves these too, so a parked action has
+ * an id the agent can poll instead of vanishing from its point of view.
+ */
+export async function getParkedActionForProject(projectId: string, id: string) {
+  const row = await prisma.healthFinding.findFirst({
+    where: { id, projectId, type: 'ai_action_pending' },
+  })
+  if (!row) return null
+  const details = (row.details as Record<string, unknown> | null) ?? {}
+  const statusMap: Record<string, string> = {
+    pending_approval: 'pending',
+    applied: 'executed',
+    auto_fixed: 'executed',
+    dismissed: 'rejected',
+    stale: 'expired',
+  }
+  return {
+    id: row.id,
+    kind: 'parked_action' as const,
+    status: statusMap[row.status] ?? row.status,
+    tool:
+      typeof details.executorAction === 'string'
+        ? details.executorAction
+        : typeof details.title === 'string'
+          ? details.title
+          : row.type,
+    target: typeof details.location === 'string' ? details.location : null,
+    createdAt: row.detectedAt.toISOString(),
+    resultSummary: null,
   }
 }
 
@@ -154,20 +223,23 @@ export async function listApprovals(projectId: string) {
     orderBy: { createdAt: 'desc' },
     take: 50,
   })
-  return rows.map((r) => ({
-    id: r.id,
-    status: effectiveStatus(r),
-    tool: r.tool,
-    target: r.target,
-    rowCount: r.rowCount,
-    reversible: r.reversible,
-    message: r.message,
-    createdAt: r.createdAt.toISOString(),
-    expiresAt: r.expiresAt.toISOString(),
-    decidedAt: r.decidedAt?.toISOString() ?? null,
-    executedAt: r.executedAt?.toISOString() ?? null,
-    resultSummary: r.resultSummary,
-  }))
+  return rows.map((r) => {
+    const view = effectiveView(r)
+    return {
+      id: r.id,
+      status: view.status,
+      tool: r.tool,
+      target: r.target,
+      rowCount: r.rowCount,
+      reversible: r.reversible,
+      message: r.message,
+      createdAt: r.createdAt.toISOString(),
+      expiresAt: r.expiresAt.toISOString(),
+      decidedAt: r.decidedAt?.toISOString() ?? null,
+      executedAt: r.executedAt?.toISOString() ?? null,
+      resultSummary: view.resultSummary,
+    }
+  })
 }
 
 export async function decideApproval(input: {
@@ -181,7 +253,7 @@ export async function decideApproval(input: {
   })
   if (!row) return { ok: false, status: 'missing', error: 'Approval request not found' }
 
-  const current = effectiveStatus(row)
+  const current = effectiveView(row).status
   if (current !== 'pending') {
     return { ok: false, status: current, error: `Request is ${current}, not pending` }
   }
@@ -246,7 +318,7 @@ export async function decideApproval(input: {
   })
   await prisma.agentApprovalRequest.update({
     where: { id: row.id },
-    data: { status: outcome.status, executedAt: new Date(), resultSummary: outcome.summary.slice(0, 2000) },
+    data: { status: outcome.status, executedAt: new Date(), resultSummary: storableResultSummary(outcome.summary) },
   })
   return { ok: outcome.status === 'executed', status: outcome.status, resultSummary: outcome.summary }
 }
@@ -327,4 +399,18 @@ export async function runApprovedCall(
   } finally {
     if (timer) clearTimeout(timer)
   }
+}
+
+/**
+ * A result summary as it may be PERSISTED.
+ *
+ * `resultSummary` is served forever: `listApprovals` hands it to every project
+ * member on the Review Queue, and `check_approval` hands it to the agent's key.
+ * An executor summary can carry a credential — executeRotateKey prints the new
+ * key under "copy now — shown once" — and storing that summary made "once"
+ * mean "until the row is deleted". The live response to the approving admin
+ * keeps the raw summary; what is stored never may.
+ */
+export function storableResultSummary(summary: string): string {
+  return withholdSecrets(summary).slice(0, 2000)
 }

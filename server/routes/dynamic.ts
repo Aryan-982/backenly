@@ -15,11 +15,13 @@
 import { Router } from 'express'
 import type { Request, Response } from 'express'
 import { prisma } from '@/lib/db'
+import { isRegionError, workspaceRawClient } from '@/lib/data-plane/regional'
 import { verify } from 'jsonwebtoken'
 import { enforceRateLimitByKeyId } from '../lib/auth'
 import { resolveJwtSecret } from '@/lib/services/jwtSecretManager'
 import { hashApiKey, resolveEndUserFromToken, crossEnvironmentUserToken } from '../lib/end-user-identity'
 import { handleViaPostgrest } from './postgrest-handler'
+import { isFunctionSwitchedOff } from '@/lib/services/ai-functions/status'
 import { v1NotFoundBody } from '@/lib/api/v1/route-not-found'
 import {
   SERVICE_ROLE_IN_BROWSER,
@@ -67,6 +69,12 @@ interface AuthResolution {
   branchSchema?: string
   /** The bound branch's name, for the X-Backenly-Environment response header. */
   branchName?: string
+  /**
+   * The key's granular permission set, for the method gate both data doors
+   * apply. Only set when a KEY authenticated: Bearer identities carry their
+   * authority in the token (end-user RLS, platform service-role), not here.
+   */
+  permissions?: string[]
   error?: string
   code?: string
   /** Replaces the generic "include a credential" hint when the credential was present but wrong. */
@@ -78,6 +86,37 @@ interface AuthResolution {
  * implementations for two surfaces over one data plane is how a fix lands on
  * one and not the other.
  */
+/**
+ * The method gate for a key's granular permissions, shared by both data doors.
+ *
+ * `set_key_permissions` and the key editor have always written
+ * `ApiKey.permissions`, and the legacy Express routers checked it — but the
+ * data plane (/db here and /api/v2) never did, so a key narrowed to ['read']
+ * kept writing and the tool's "✅ permissions updated" changed nothing that
+ * mattered. Service-role keys bypass by definition, as in checkPermission;
+ * 'admin' grants everything via hasPermission. Returns true when it REFUSED
+ * (response already sent), mirroring refuseUnlessServing's contract.
+ */
+export function refuseIfKeyLacksMethodPermission(
+  req: Request,
+  res: Response,
+  auth: AuthResolution,
+): boolean {
+  if (!auth.keyId || auth.isServiceRole) return false
+  const required = req.method === 'GET' || req.method === 'HEAD' ? 'read' : 'write'
+  const permissions = auth.permissions ?? []
+  const allowed = permissions.includes('admin') || permissions.includes(required)
+  if (allowed) return false
+  res.status(403).json({
+    code: 'INSUFFICIENT_KEY_PERMISSIONS',
+    error: `This API key does not have '${required}' permission.`,
+    required,
+    permissions,
+    hint: `The key's permission set is ${JSON.stringify(permissions)}. Use a key with '${required}' access, or update this key's permissions.`,
+  })
+  return true
+}
+
 export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution> {
   const xApiKey = req.headers['x-api-key'] as string | undefined
   if (xApiKey) {
@@ -167,6 +206,15 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
         ? { id: key.branch.id, name: key.branch.name, schemaName: key.branch.schemaName }
         : null
       const endUser = await resolveEndUserFromToken(key.projectId, userToken, branch)
+      if (endUser === 'blocked') {
+        // The promised behavior of block_end_user: a 403 on the next
+        // request, not a silent downgrade to the anonymous identity.
+        return {
+          success: false,
+          error: 'This account has been blocked by the project owner.',
+          code: 'END_USER_BLOCKED',
+        }
+      }
       if (endUser) {
         endUserId = endUser.userId
         userRole = endUser.role
@@ -215,6 +263,7 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
       userRole,
       branchSchema: key.branch?.schemaName,
       branchName: key.branch?.name,
+      permissions: key.permissions ?? [],
     }
   }
 
@@ -251,9 +300,13 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
         if (!decoded?.userId) return { success: false, error: 'Invalid token', code: 'INVALID_TOKEN' }
         // Reject tokens revoked via /auth/logout.
         if (decoded.jti) {
+          // The blacklist is in the project's database, in its region.
+          // Resolved outside the catch below, which reads any failure as "not
+          // revoked": a region this process cannot reach must not be.
+          const db = await workspaceRawClient(decoded.projectId)
           try {
             const schemaName = `workspace_${decoded.projectId}`
-            const rows = await prisma.$queryRawUnsafe<{ jti: string }[]>(
+            const rows = await db.$queryRawUnsafe<{ jti: string }[]>(
               `SELECT jti FROM "${schemaName}"."_token_blacklist" WHERE jti = $1 LIMIT 1`,
               decoded.jti,
             )
@@ -288,7 +341,9 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
       })
       if (!user || user.projects.length === 0) return { success: false, error: 'No project found for user', code: 'NO_PROJECT' }
       return { success: true, projectId: user.projects[0].id, userId: user.id, isServiceRole: true }
-    } catch {
+    } catch (err) {
+      // An unreachable region is the server's fault, not the token's.
+      if (isRegionError(err)) throw err
       return { success: false, error: 'Invalid or expired token', code: 'INVALID_TOKEN' }
     }
   }
@@ -357,6 +412,7 @@ async function handleDynamicRequest(req: Request, res: Response) {
   // never saw when the path is the legacy `/api/v1/{table}` form. Judge it now
   // that it is known, or a paused or locked project's key walks straight past.
   if (await refuseUnlessServing(res, projectId)) return
+  if (refuseIfKeyLacksMethodPermission(req, res, authResult)) return
   void touchProjectActivity(projectId)
 
   // Strip the URL prefix that the SDK and verifier always include:
@@ -421,11 +477,14 @@ async function handleDynamicRequest(req: Request, res: Response) {
       // may well be the one that works — which is also the only way it can
       // recover on its own.
       //
-      // 'disabled' remains a real refusal: that one is a deliberate act, not a
-      // side effect of a runtime error.
-      if (fn.status === 'disabled' || fn.status === 'deleted') {
+      // A deliberate OFF remains a real refusal: that one is an owner's act,
+      // not a side effect of a runtime error. The console toggle and MCP
+      // set_active write 'inactive' — this gate once listed only the older
+      // 'disabled'/'deleted' spellings, so a switched-off function stayed live
+      // here while every other surface said it was off.
+      if (isFunctionSwitchedOff(fn.status)) {
         res.status(409).json({
-          error: `Function "${fnName}" is disabled`,
+          error: `Function "${fnName}" is switched off`,
           code: 'FUNCTION_DISABLED',
           hint: 'Re-enable it from the project\'s Functions page, or regenerate it with generate_function.',
         })

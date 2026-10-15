@@ -20,11 +20,15 @@ import { answererPrompt } from './prompts'
 import { kickReconciler, shouldKickFor } from '@/lib/autonomy/event-trigger'
 import { WEBHOOK_EVENT_TYPES } from '@/lib/webhooks/events'
 import { publicOrigin } from '@/lib/branches/preview'
+import { SERVED_OAUTH_PROVIDERS, isServedOAuthProvider } from '@/lib/services/oauth-providers'
+
+/** Executor actions whose audit rows record who acted (see runExecutor). */
+const ACTOR_AUDITED_ACTIONS = new Set<string>(['TRIGGER_DEPLOY', 'ROLLBACK_DEPLOY'])
 
 /** Brain tools served by lib/email/agent-actions.ts. */
 const AUTH_EMAIL_TOOLS = new Set<string>([
   'get_auth_email_settings', 'set_auth_smtp', 'test_auth_smtp', 'remove_auth_smtp',
-  'set_auth_email_template', 'reset_auth_email_template',
+  'set_auth_email_template', 'reset_auth_email_template', 'set_auth_email_policy',
 ])
 
 /** Brain tools served by lib/webhooks/agent-actions.ts. */
@@ -81,6 +85,7 @@ export type ToolName =
   | 'disable_oauth_provider'
   | 'create_bucket'
   | 'set_bucket_public'
+  | 'set_bucket_policy'
   | 'add_rls'
   | 'set_rls'
   | 'create_trigger'
@@ -123,13 +128,14 @@ export type ToolName =
   | 'verify_integration_key'
   // Which project and credential this caller is acting as
   | 'get_connection_identity'
-  // End-user auth email: sender and templates (the Auth page)
+  // End-user auth email: sender, templates and policy (the Auth page)
   | 'get_auth_email_settings'
   | 'set_auth_smtp'
   | 'test_auth_smtp'
   | 'remove_auth_smtp'
   | 'set_auth_email_template'
   | 'reset_auth_email_template'
+  | 'set_auth_email_policy'
   // Connect Frontend
   | 'connect_frontend'
   | 'disconnect_frontend'
@@ -156,8 +162,6 @@ export type ToolName =
   | 'toggle_ai_function'
   | 'delete_ai_function'
   | 'delete_cron_job'
-  // Monitoring
-  | 'set_alert'
   // Autonomy
   | 'set_autonomy_level'
   // Agent-native operator surface (open loop / 24-7 brain)
@@ -329,9 +333,13 @@ export interface ToolDispatchContext {
    */
   agentSurface?: boolean
   /**
-   * Schema migrations are a declared sequence of typed actions. A failed step
-   * must be reported to the caller, not replaced with an LLM-generated action.
-   * Other dispatcher callers retain the executor's normal replanning default.
+   * Whether a failed executor action may be replaced by one a model picks from
+   * the error (minimal-executor's replanning). Off unless a caller opts in: a
+   * typed call is a declared action, so a failure is reported to the caller,
+   * never swapped for a different action it did not ask for. The MCP tool
+   * route and approved calls used to inherit replanning, so a failed typed
+   * call could run a model-chosen action and spend uncharged model budget.
+   * Only the brain's own loop opts in.
    */
   allowReplan?: boolean
   /**
@@ -371,8 +379,16 @@ export interface ToolResult {
  * deploy_function_code stores source its caller already wrote; the brain writes
  * code through generate_function, which repairs what it writes, and two doors
  * to one behaviour is what the catalog was cut down to avoid.
+ *
+ * rotate_api_key is withheld from the model for the reason the connect domain
+ * already refuses to route it (lib/mcp/domains.ts): its result IS a new
+ * credential, and the chat door parks destructive calls for approval, whose
+ * stored outcome every project member can read. A rotation the model requested
+ * therefore either leaked the new key into the approval row or, with the
+ * stored summary now withheld, rotated into a key nobody was ever shown.
+ * Humans rotate from the dashboard, where the key is handed over once.
  */
-export const AGENT_ONLY_TOOLS = new Set<string>(['deploy_function_code'])
+export const AGENT_ONLY_TOOLS = new Set<string>(['deploy_function_code', 'rotate_api_key'])
 
 // ── Tool schema ───────────────────────────────────────────────────────────────
 
@@ -480,14 +496,14 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     'If you do NOT have them, call this tool with only `provider` — it stops the turn and asks the user to paste their credentials. ' +
     'Once the user provides them, call again with `clientId` + `clientSecret` and it configures the provider.',
     {
-      provider: { type: 'string', enum: ['google', 'github', 'discord', 'facebook', 'apple'] },
+      provider: { type: 'string', enum: [...SERVED_OAUTH_PROVIDERS] },
       clientId: { type: 'string', description: 'OAuth Client ID from the provider\'s developer console.' },
       clientSecret: { type: 'string', description: 'OAuth Client Secret from the provider\'s developer console.' },
     },
     ['provider']),
   fn('disable_oauth_provider',
     'DESTRUCTIVE. Turn off an OAuth sign-in provider — end-users using it lose the ability to sign in. The stored Client ID and Secret are kept so re-enabling later is a one-step toggle without re-pasting credentials. Requires confirmation.',
-    { provider: { type: 'string', enum: ['google', 'github', 'discord', 'facebook', 'apple'] } },
+    { provider: { type: 'string', enum: [...SERVED_OAUTH_PROVIDERS] } },
     ['provider']),
   fn('create_bucket',
     'Create a storage bucket for file uploads.',
@@ -618,11 +634,13 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     },
     ['tableName']),
   fn('create_trigger',
-    'Create an event trigger on a table (insert|update|delete) — webhook or NOTIFY.',
+    'Create an event trigger on a table (insert|update|delete) — webhook or NOTIFY. ' +
+    'kind "webhook" REQUIRES webhookUrl (the endpoint to call); without it the trigger is refused, never created dead.',
     {
       tableName: { type: 'string' },
       on: { type: 'string', enum: ['insert', 'update', 'delete'] },
       kind: { type: 'string', enum: ['webhook', 'notify'] },
+      webhookUrl: { type: 'string', description: 'For kind "webhook" only — the HTTP(S) endpoint the trigger calls. Required for webhooks.' },
     },
     ['tableName', 'on', 'kind']),
   fn('sync_column',
@@ -671,7 +689,8 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     'Create a backend function. Backenly functions are EVENT-DRIVEN or HTTP — pick the `trigger` that matches what the user described:\n' +
     '  • on_signup — runs automatically every time an end-user signs up (welcome emails, default rows, tier assignment, analytics identify).\n' +
     '  • on_insert / on_update / on_delete — runs automatically every time a row is inserted / updated / deleted in `table` ' +
-    '(denormalised counters, audit rows, notifications — "when an order is created…", "when a post is published…"). REQUIRES `table`.\n' +
+    '(denormalised counters, audit rows, notifications — "when an order is created…", "when a post is published…"). REQUIRES `table`. ' +
+    'Row events are captured inside PostgreSQL, so every writer fires them — REST, SDK, MCP, SQL in another function — within about a minute of the write. Auth-managed tables (users) are not captured; use on_signup.\n' +
     '  • http — a callable REST endpoint at /api/v1/{projectId}/fn/{name} that a frontend or another service hits directly ' +
     '("an endpoint to export orders as CSV", "a /checkout/session endpoint").\n' +
     '  • manual — only runs when fired from the Functions dashboard (occasional maintenance / recompute tasks).\n' +
@@ -940,6 +959,18 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     'Go back to Backenly\'s default template for one auth email.',
     { kind: { type: 'string', enum: ['verification', 'password_reset', 'magic_link'] } },
     ['kind']),
+  fn('set_auth_email_policy',
+    'Set what this project\'s auth emails say and when they are required. Pass only the fields to change. ' +
+    'Turning requireEmailVerification on needs a working sender first (set_auth_smtp, then test_auth_smtp): ' +
+    'sign-in refuses an unverified address while it is on, so without a sender every new user would be stranded. ' +
+    'Users who already exist are recorded as verified when it is turned on, so they are not locked out.',
+    {
+      appName: { type: 'string', description: 'The name auth emails are branded with; empty falls back to the project name.' },
+      appUrl: { type: 'string', description: 'The app\'s base URL; password reset links land on it. Empty falls back to the published URL.' },
+      requireEmailVerification: { type: 'boolean', description: 'Refuse sign-in until the address is verified.' },
+      magicLinksEnabled: { type: 'boolean', description: 'Offer passwordless sign-in by emailed link.' },
+    },
+    []),
   fn('fix_backend',
     'Repair a broken subsystem. target: auth | api | table | deploy | realtime | storage | integration | workflow. Use when read_backend_state shows something is broken.',
     {
@@ -1036,9 +1067,11 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     'Returns the branch\'s PREVIEW ENDPOINT, ready to test: the base URL (the same as production), a client key ' +
     'bound to the branch (shown once), the X-Backenly-Environment value every data response will carry, an OpenAPI ' +
     'URL, and instructions to hand to a test. That key reads and writes the branch through the data API (/db and ' +
-    '/api/v2) and is REFUSED by every other endpoint (auth, functions, storage, realtime) rather than served from ' +
-    'production. connect_branch issues more keys.\n' +
-    'Schema changes made with apply_migration, create_table or any other build tool still apply to main, not to a branch.',
+    '/api/v2) and runs end-user auth on the branch (signup, signin, refresh-token, logout — branch users only). ' +
+    'Functions, storage, realtime and the emailed auth flows REFUSE it rather than serve from production. ' +
+    'connect_branch issues more keys.\n' +
+    'Schema changes target the branch when apply_migration is called WITH its branchId; without one — and from ' +
+    'create_table or any other build tool — they still apply to main.',
     {
       name: { type: 'string', description: 'Branch name, e.g. "add-payments". Lowercase kebab-case.' },
       includeData: {
@@ -1160,9 +1193,19 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
 
   // ── Storage edit / delete ─────────────────────────────────────────────────
   fn('set_bucket_public',
-    'Flip a bucket public ↔ private. Public buckets serve files at a stable URL; private buckets require a signed URL. Changes apply immediately to all files.',
+    'Flip a bucket public ↔ private (shorthand for the public_read / private access policies). Public buckets serve files at a stable URL; private buckets require a signed URL. Changes apply immediately to all files. For owner_only or cdn_cacheable, use set_bucket_policy.',
     { bucketName: { type: 'string' }, isPublic: { type: 'boolean' } },
     ['bucketName', 'isPublic']),
+  fn('set_bucket_policy',
+    "Set a bucket's access policy — the field serving, upload clamping and the console all enforce. " +
+    'public_read: anyone with the URL reads objects marked public. cdn_cacheable: public_read plus aggressive caching. ' +
+    'private: signed URLs only. owner_only: each object is readable only by the end user who uploaded it (and operators). ' +
+    'The answer reports the enforced state read back from the bucket.',
+    {
+      bucketName: { type: 'string' },
+      policy: { type: 'string', enum: ['public_read', 'cdn_cacheable', 'private', 'owner_only'] },
+    },
+    ['bucketName', 'policy']),
   fn('delete_bucket',
     'DESTRUCTIVE. Delete a storage bucket AND every file inside it. Requires explicit user confirmation in the same turn.',
     { bucketName: { type: 'string' } },
@@ -1174,10 +1217,10 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
 
   // ── Connect Frontend ──────────────────────────────────────────────────────
   fn('connect_frontend',
-    'Connect a deployed frontend to this backend. Pass the frontend URL the user gave you ("app.acme.com", "https://app.replit.com/x", "localhost:3000"). The engine normalizes it to an exact origin, verifies the backend has been deployed, and (unless force=true) returns a confirmation prompt — the user must type CONNECT to proceed. Pin to the deployed backend version. Use whenever the user says "hook up my app at <url>", "connect my Replit / Lovable / Vercel frontend", "let app.x.com call my APIs".',
+    'Connect a frontend to this backend. Pass the frontend URL the user gave you ("app.acme.com", "https://app.replit.com/x", "localhost:3000"). The engine normalizes it to an exact origin. In backend_chat it returns a confirmation prompt (unless force=true) and the user must type CONNECT; the typed MCP door, acting on an owner-held key, binds at once. Connected origins become the project\'s CORS allowlist: once one is connected, browser calls from other origins are refused on the SDK routes the web app answers, so connect every frontend that calls this backend. No publish is needed first: the API already answers, and the connection records the published version when there is one. Use whenever the user says "hook up my app at <url>", "connect my Replit / Lovable / Vercel frontend", "let app.x.com call my APIs".',
     {
       url: { type: 'string', description: 'The frontend URL the user named. Will be normalized to a CORS origin.' },
-      force: { type: 'boolean', description: 'Set true ONLY when the user has already typed CONNECT in this turn — skips the confirmation gate.' },
+      force: { type: 'boolean', description: 'backend_chat only: set true ONLY when the user has already typed CONNECT in this turn, which skips the confirmation prompt. The typed MCP door binds without a prompt.' },
     },
     ['url']),
   fn('disconnect_frontend',
@@ -1190,21 +1233,17 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
 
   // ── Publish / Deploy ──────────────────────────────────────────────────────
   fn('trigger_deploy',
-    'DESTRUCTIVE-grade. Publish the current backend (tables, APIs, auth, storage, triggers, RLS become publicly callable). The engine runs a readiness gate and a "Type DEPLOY to confirm" prompt — surface the prompt verbatim to the user. Re-call with force:true ONLY after the user replies DEPLOY. Use when the user says "ship it" / "publish" / "go live".',
-    {
-      environment: { type: 'string', enum: ['production', 'staging'], description: 'Default production.' },
-      force: { type: 'boolean', description: 'Set true ONLY when the user has typed DEPLOY verbatim this turn.' },
-    }),
+    'DESTRUCTIVE-grade. Publish the current backend (tables, APIs, auth, storage, triggers, RLS become publicly callable) as the next production version. There is one production deployment per project; deploy has no staging target. It waits for a person: the call is queued for the project owner to approve in the dashboard, and the approved call runs the readiness gate and publishes. Nothing typed in chat approves it. Use when the user says "ship it" / "publish" / "go live".',
+    {}),
   fn('rollback_deploy',
-    'DESTRUCTIVE. Revert the live backend to a previous published version. Engine returns a "Type ROLLBACK to confirm" prompt unless force:true. Always call get_deploy_status / list_apis first so you know which version you would be reverting to.',
+    'DESTRUCTIVE. Mark a previous published version as current in the version history. This is bookkeeping: it does NOT change the live schema, data, RLS or functions, and the API keeps serving exactly what is deployed now. To restore structure, roll back a schema version from the Database page or restore a Snapshot. It waits for a person: the call is queued for the project owner to approve in the dashboard, and the approved call runs exactly as made. Always call get_deploy_status first.',
     {
       version: { type: 'integer', description: 'Target published version number (e.g. 2). Either version OR deploymentId is required.' },
       deploymentId: { type: 'string', description: 'Specific deployment id to roll back to.' },
-      force: { type: 'boolean', description: 'Set true ONLY when the user has typed ROLLBACK verbatim this turn.' },
     }),
   fn('get_readiness',
     'Read the production-readiness scorecard for this project (0-100). Returns blockers, warnings, and auto-fixable items. Call before trigger_deploy so you can tell the user exactly what is missing.',
-    { autoFix: { type: 'boolean', description: 'Apply safe auto-fixes (JWT generation, default RLS) during the scan. Default true.' } }),
+    { autoFix: { type: 'boolean', description: 'Apply the safe fixes (owner RLS where an owner is clear, the project JWT secret, the auth flag, switching off placeholder functions with live triggers). Default false: a readiness read changes nothing.' } }),
   fn('set_env_var',
     'Save an encrypted env var for this project. Available to AI functions as ctx.env.<KEY>. Keys must be UPPER_SNAKE_CASE. Values are encrypted at rest (AES-256-GCM). Use for third-party secrets the user has (STRIPE_WEBHOOK_SECRET, RESEND_API_KEY, etc). Do NOT use for first-party platform secrets (JWT_SECRET, DATABASE_URL).',
     {
@@ -1257,7 +1296,20 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     'a property of the key, not of the request, so there is no header or parameter that switches it later.',
     {
       description: { type: 'string', description: 'Human label, e.g. "web frontend" or "cron worker".' },
-      permissions: { type: 'array', items: { type: 'string' }, description: 'e.g. ["read:posts","write:posts"]. Default ["read:*"].' },
+      permissions: {
+        type: 'array',
+        items: { type: 'string', enum: ['read', 'write', 'ai-only'] },
+        description:
+          'The runtime reads exactly these values — there is no per-table scoping. Default ["read","write"].',
+      },
+      expiresInDays: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 3650,
+        description:
+          'Optional. Omitted means the key NEVER expires (same as dashboard keys). When set, the runtime ' +
+          'refuses the key after this many days and the response says the exact date.',
+      },
       serviceRole: {
         type: 'boolean',
         description:
@@ -1281,10 +1333,10 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     { keyId: { type: 'string' } },
     ['keyId']),
   fn('set_key_permissions',
-    'Update the permission set on an existing API key (e.g. add write access to a new table).',
+    "Replace a publishable key's permission set. Vocabulary: read, write, ai-only — the whole set the runtime reads; there is no per-table scoping. 'admin' is not grantable here (it passes every gate; that escalation belongs to the project owner in Settings), and service-role keys are refused because their access is not permission-driven.",
     {
       keyId: { type: 'string' },
-      permissions: { type: 'array', items: { type: 'string' } },
+      permissions: { type: 'array', items: { type: 'string', enum: ['read', 'write', 'ai-only'] } },
     },
     ['keyId', 'permissions']),
 
@@ -1299,6 +1351,7 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
       apiKey: { type: 'string', description: 'The secret to store (encrypted). Omit to trigger the inline "paste your key" prompt.' },
       label: { type: 'string', description: 'Optional human label, e.g. "Stripe live key".' },
       webhookSecret: { type: 'string', description: 'Stripe only: the endpoint signing secret (whsec_…). Until it is stored, the Stripe receiver rejects every event.' },
+      appId: { type: 'string', description: 'OneSignal only: the App ID, sent with the REST API key. Push stays off until both are stored.' },
     },
     ['integrationId']),
   fn('remove_integration_key',
@@ -1326,15 +1379,12 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     { jobId: { type: 'string' }, name: { type: 'string' } }),
 
   // ── Monitoring ────────────────────────────────────────────────────────────
-  fn('set_alert',
-    'Configure a monitoring alert. Supported channels: email + dashboard. Trigger types: error_rate, latency_p95, request_rate, integration_failure.',
-    {
-      type: { type: 'string', enum: ['error_rate', 'latency_p95', 'request_rate', 'integration_failure'] },
-      threshold: { type: 'number', description: 'Numeric threshold (e.g. 5 for "5% error rate", 800 for "800ms p95").' },
-      windowMinutes: { type: 'integer', minimum: 5, maximum: 1440 },
-      channel: { type: 'string', enum: ['email', 'dashboard', 'both'] },
-    },
-    ['type', 'threshold']),
+  // No set_alert: it stored config under project.activeIntegrations that
+  // nothing ever evaluates, so the agent was told an alert was "active" that
+  // could never fire — and its mapper sent `type` where the executor read
+  // `metric`, so even the storage path always failed. The MCP door already
+  // removed it (see lib/mcp/domains.ts); the brain follows. It returns when
+  // an evaluator exists.
 
   // ── Autonomy ──────────────────────────────────────────────────────────────
   fn('set_autonomy_level',
@@ -1495,6 +1545,7 @@ export const TOOL_TO_ACTION: Record<string, (args: any) => AIAction> = {
   // dispatchTool() that handles the "no credentials yet → ask the user" flow.
   create_bucket: (a) => ({ action: 'CREATE_BUCKET', params: { bucketName: a.bucketName, isPublic: !!a.isPublic } }),
   set_bucket_public: (a) => ({ action: 'SET_BUCKET_PUBLIC', params: { bucketName: a.bucketName, isPublic: !!a.isPublic } }),
+  set_bucket_policy: (a) => ({ action: 'SET_BUCKET_POLICY', params: { bucketName: a.bucketName, policy: a.policy } }),
   // ── set_rls: the four commands arrive as top-level arguments ───────────────
   //
   // Flat `select`/`insert`/`update`/`delete` rather than a nested `commands`
@@ -1675,6 +1726,8 @@ export const TOOL_TO_ACTION: Record<string, (args: any) => AIAction> = {
           name: a.name,
           description: a.description,
           method: String(a.method || 'POST').toUpperCase(),
+          // An agent's create never overwrites a function that exists (FN-10).
+          refuseExisting: true,
         },
       }
     }
@@ -1697,6 +1750,8 @@ export const TOOL_TO_ACTION: Record<string, (args: any) => AIAction> = {
         description: a.description,
         triggerType,
         triggerTable: isDbEvent ? (a.table || null) : null,
+        // An agent's create of a name that exists is refused, not a silent no-op (FN-08).
+        refuseExisting: true,
       },
     }
   },
@@ -1744,9 +1799,9 @@ export const TOOL_TO_ACTION: Record<string, (args: any) => AIAction> = {
   disconnect_frontend: (a) => ({ action: 'DISCONNECT_FRONTEND', params: { url: a.url, force: !!a.force } }),
 
   // Publish / Deploy
-  trigger_deploy: (a) => ({ action: 'TRIGGER_DEPLOY', params: { environment: a.environment || 'production', force: !!a.force } }),
-  rollback_deploy: (a) => ({ action: 'ROLLBACK_DEPLOY', params: { version: a.version, deploymentId: a.deploymentId, force: !!a.force } }),
-  get_readiness: (a) => ({ action: 'GET_READINESS', params: { autoFix: a.autoFix } }),
+  trigger_deploy: () => ({ action: 'TRIGGER_DEPLOY', params: {} }),
+  rollback_deploy: (a) => ({ action: 'ROLLBACK_DEPLOY', params: { version: a.version, deploymentId: a.deploymentId } }),
+  get_readiness: (a) => ({ action: 'GET_READINESS', params: { autoFix: a.autoFix === true } }),
   set_env_var: (a) => ({ action: 'SET_ENV_VAR', params: { key: a.key, value: a.value, description: a.description } }),
   list_env_vars: () => ({ action: 'LIST_ENV_VARS', params: {} }),
   delete_env_var: (a) => ({ action: 'DELETE_ENV_VAR', params: { key: a.key } }),
@@ -1763,26 +1818,30 @@ export const TOOL_TO_ACTION: Record<string, (args: any) => AIAction> = {
   // environment can be chosen — the data plane reads its schema from the
   // credential, never from the request. Dropping it here is what made branch
   // routing unreachable from the agent lane.
-  create_api_key: (a) => ({ action: 'CREATE_KEY', params: { description: a.description, permissions: a.permissions, serviceRole: a.serviceRole === true, branchId: a.branchId } }),
+  create_api_key: (a) => ({ action: 'CREATE_KEY', params: { description: a.description, permissions: a.permissions, serviceRole: a.serviceRole === true, branchId: a.branchId, expiresInDays: a.expiresInDays } }),
   revoke_api_key: (a) => ({ action: 'REVOKE_KEY', params: { keyId: a.keyId } }),
   rotate_api_key: (a) => ({ action: 'ROTATE_KEY', params: { keyId: a.keyId } }),
   set_key_permissions: (a) => ({ action: 'SET_KEY_PERMISSIONS', params: { keyId: a.keyId, permissions: a.permissions } }),
 
   // Integrations
-  store_integration_key: (a) => ({ action: 'STORE_INTEGRATION_KEY', params: { integrationId: a.integrationId, apiKey: a.apiKey, label: a.label, webhookSecret: a.webhookSecret } }),
+  store_integration_key: (a) => ({ action: 'STORE_INTEGRATION_KEY', params: { integrationId: a.integrationId, apiKey: a.apiKey, label: a.label, webhookSecret: a.webhookSecret, appId: a.appId } }),
   remove_integration_key: (a) => ({ action: 'REMOVE_INTEGRATION_KEY', params: { integrationId: a.integrationId } }),
   delete_trigger: (a) => ({ action: 'DELETE_TRIGGER', params: { triggerId: a.triggerId, name: a.name } }),
 
   // Functions lifecycle
-  toggle_ai_function: (a) => ({ action: 'TOGGLE_AI_FUNCTION', params: { functionId: a.functionId, name: a.name, active: !!a.active } }),
+  // Only a real boolean (or the exact strings a lax host sends) says which way;
+  // anything else reaches the executor as undefined and is refused (FN-13).
+  toggle_ai_function: (a) => ({
+    action: 'TOGGLE_AI_FUNCTION',
+    params: {
+      functionId: a.functionId,
+      name: a.name,
+      active: a.active === true || a.active === 'true' ? true : a.active === false || a.active === 'false' ? false : undefined,
+    },
+  }),
   delete_ai_function: (a) => ({ action: 'DELETE_AI_FUNCTION', params: { functionId: a.functionId, name: a.name } }),
   delete_cron_job: (a) => ({ action: 'DELETE_CRON_JOB', params: { jobId: a.jobId, name: a.name } }),
 
-  // Monitoring
-  set_alert: (a) => ({
-    action: 'SET_ALERT',
-    params: { type: a.type, threshold: a.threshold, windowMinutes: a.windowMinutes, channel: a.channel || 'dashboard' },
-  }),
 }
 
 const FIX_TARGET_TO_ACTION: Record<string, AIAction['action']> = {
@@ -1804,6 +1863,85 @@ const FIX_TARGET_TO_ACTION: Record<string, AIAction['action']> = {
  * their chat. This is the standard funded-platform pattern: the model gets to
  * iterate against the validator in private; users only see real work.
  */
+/**
+ * Refuse a create_table of a table that exists, or an add_column on one that
+ * does not, with the wording apply_migration uses. Reads the catalog through
+ * the same helper apply_migration does, on the database in the project's
+ * region, so the doors cannot disagree.
+ */
+async function tableExistencePreflight(
+  name: 'create_table' | 'add_column',
+  args: Record<string, unknown>,
+  projectId: string,
+): Promise<ToolResult | null> {
+  const raw = String(args.tableName ?? '').trim()
+  // No name: the executor's own "table name is required" answers that.
+  if (!raw) return null
+  // create_table lowercases the name it creates; add_column uses it as given.
+  const table = name === 'create_table' ? raw.toLowerCase() : raw
+  const { getWorkspaceDatabaseNames } = await import('@/lib/services/databaseProvisioning')
+  const { existingTables } = await import('@/lib/mcp/apply-migration')
+  const schema = getWorkspaceDatabaseNames(projectId).postgresSchema
+  const exists = (await existingTables(projectId, schema, [table])).has(table)
+
+  if (name === 'create_table' && exists) {
+    return {
+      ok: false,
+      code: 'TABLE_EXISTS',
+      summary:
+        `Table ${table} already exists, so create_table would change nothing. Nothing was created. ` +
+        `To add columns use add_column; get_table_schema shows what ${table} has now.`,
+    }
+  }
+  if (name === 'add_column' && !exists) {
+    const suggestion = await closestTableName(projectId, schema, table)
+    return {
+      ok: false,
+      code: 'TABLE_NOT_FOUND',
+      summary:
+        `There is no table ${table} in this project, so add_column cannot run. Nothing was changed.` +
+        (suggestion ? ` Did you mean ${suggestion}?` : '') +
+        ' If it is a new table, create it first with create_table.',
+    }
+  }
+  return null
+}
+
+/**
+ * The existing table whose name is closest to `wanted` (edit distance ≤ 2, or a
+ * case-only difference), read in the project's region like existingTables: the
+ * home database holds no regional project's tables, so it would never suggest one.
+ */
+async function closestTableName(projectId: string, schema: string, wanted: string): Promise<string | null> {
+  const { workspaceRawClient } = await import('@/lib/data-plane/regional')
+  const db = await workspaceRawClient(projectId)
+  const rows = await db.$queryRawUnsafe<Array<{ table_name: string }>>(
+    `SELECT table_name FROM information_schema.tables WHERE table_schema = $1 AND table_type = 'BASE TABLE'`,
+    schema,
+  )
+  const target = wanted.toLowerCase()
+  let best: { name: string; distance: number } | null = null
+  for (const { table_name } of rows) {
+    const d = editDistance(target, table_name.toLowerCase())
+    if (d <= 2 && (!best || d < best.distance)) best = { name: table_name, distance: d }
+  }
+  return best?.name ?? null
+}
+
+function editDistance(a: string, b: string): number {
+  const prev = Array.from({ length: b.length + 1 }, (_, j) => j)
+  for (let i = 1; i <= a.length; i++) {
+    let diag = prev[0]
+    prev[0] = i
+    for (let j = 1; j <= b.length; j++) {
+      const up = prev[j]
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1))
+      diag = up
+    }
+  }
+  return prev[b.length]
+}
+
 function preflightValidate(
   name: string,
   args: Record<string, unknown>,
@@ -1910,6 +2048,17 @@ export async function dispatchTool(
     }
   }
 
+  // ── The table a schema call names must be in the state it assumes ─────────
+  // apply_migration's rule (checkPlan), on the typed doors too: create_table of
+  // an existing table changed nothing and answered "Created", and add_column on
+  // a missing table CREATED it, so a typo made a stray one-column table while
+  // the agent believed it had changed the real one (DB-06). Internal callers of
+  // the executor (blueprints, auto-wiring) keep their idempotent create.
+  if (name === 'create_table' || name === 'add_column') {
+    const refusal = await tableExistencePreflight(name, args, ctx.projectId)
+    if (refusal) return refusal
+  }
+
   ctx.onToolEvent?.({ phase: 'start', tool: name as ToolName, title })
 
   const finalize = (r: ToolResult): ToolResult => {
@@ -1975,7 +2124,7 @@ export async function dispatchTool(
         '- `read_backend_state` with NO arguments — the grounding overview: tables, APIs, auth, storage, RLS.',
         '- `read_backend_state { section: "schema" }` — every table with record counts + all foreign-key relationships. Record counts reveal one-to-many joins (use COUNT(DISTINCT …), never a naive COUNT(*) over a join).',
         '- `get_table_schema { tableName }` — BEFORE any query/insert/migration on a table. Columns (type/nullable/default/PK), foreign keys, indexes, CHECK constraints WITH THEIR EXACT ALLOWED VALUES, triggers, and the live RLS policies. Reading this is what stops a write failing on a constraint you could have seen.',
-        '- Other sections: `tables`, `apis`, `functions`, `rls`, `triggers`, `keys`, `users`, `buckets`, `files`, `cron`, `env`, `integrations`, `apps`, `webhooks`, `metrics`, `errors`, `usage`, `deploy`, `readiness`, `findings`, `incidents`, `autonomy`, `maintenance`, `realtime`.',
+        '- Other sections: `tables`, `apis`, `functions`, `rls`, `triggers`, `keys`, `users`, `buckets`, `files`, `cron`, `env`, `integrations`, `apps`, `webhooks`, `deliveries`, `metrics`, `errors`, `usage`, `deploy`, `readiness`, `findings`, `incidents`, `autonomy`, `maintenance`, `realtime`.',
         '',
         '## 2. Build',
         '- `apply_migration { sql }` for schema. Ordinary PostgreSQL DDL: CREATE TABLE, ALTER TABLE ADD COLUMN / RENAME COLUMN / ADD CONSTRAINT, CREATE INDEX. Multiple statements, semicolon-separated. Your DDL is applied AS WRITTEN — declared NOT NULL, DEFAULT and nullability are honoured exactly. Every table also gets `id`, `"createdAt"`, `"updatedAt"` (camelCase) and `"deleted_at"`; a declared `id`, `created_at` or `updated_at` is skipped in their favour and reported, so order by `"createdAt"`.',
@@ -2195,7 +2344,12 @@ export async function dispatchTool(
             : '  • No key was issued: call connect_branch for one.',
           `  • Every data response carries ${endpoint.environmentHeader.name}: ${endpoint.environmentHeader.value}`,
           `  • Smoke test: ${preview.previewCurl(endpoint, 'your_table', keyText)}`,
-          `  • Only /db and /api/v2 are branch-scoped; auth, functions, storage and realtime refuse this key.`,
+          // Mirrors BRANCH_SCOPED_SURFACES (lib/branches/key-scope.ts) — the
+          // instructions in data.preview say the same; this line used to
+          // claim auth refuses the key while they said auth runs on the
+          // branch, in the same response.
+          `  • Branch-scoped: /db, /api/v2, and end-user auth (signup, signin, refresh-token, logout). ` +
+          `Functions, storage, realtime and the emailed auth flows refuse this key (403 BRANCH_SURFACE_UNAVAILABLE).`,
         ]
         return {
           summary: lines.join('\n'),
@@ -2307,7 +2461,10 @@ export async function dispatchTool(
       }
 
       if (name === 'merge_branch') {
-        const res = await engine.mergeBranch(ctx.projectId, ctx.userId ?? '', branchId)
+        const approvedMigrations = Array.isArray((args as any).approvedMigrations)
+          ? ((args as any).approvedMigrations as unknown[]).map(String)
+          : undefined
+        const res = await engine.mergeBranch(ctx.projectId, ctx.userId ?? '', branchId, approvedMigrations)
         if (!res.ok) return finalize({ ok: false, summary: (res as any).error, code: (res as any).code })
         const r: any = res
         const applied = r.applied?.length ? `Applied: ${r.applied.join('; ')}.` : 'Nothing was applied automatically.'
@@ -2619,7 +2776,16 @@ export async function dispatchTool(
       const cap = provider ? provider.charAt(0).toUpperCase() + provider.slice(1) : 'that provider'
 
       if (!provider) {
-        return finalize({ ok: false, summary: 'Which OAuth provider? Supported: google, github, discord, facebook, apple.' })
+        return finalize({ ok: false, summary: `Which OAuth provider? Supported: ${SERVED_OAUTH_PROVIDERS.join(', ')}.` })
+      }
+      // Refuse before asking the owner for credentials a provider with no
+      // sign-in flow could never use.
+      if (!isServedOAuthProvider(provider)) {
+        return finalize({
+          ok: false,
+          code: 'UNSUPPORTED_PROVIDER',
+          summary: `${cap} sign-in is not available: the runtime serves ${SERVED_OAUTH_PROVIDERS.join(', ')}.`,
+        })
       }
 
       if (!clientId || !clientSecret) {
@@ -2733,6 +2899,7 @@ export async function dispatchTool(
         remove_auth_smtp: () => e.removeSmtp(actor),
         set_auth_email_template: () => e.setEmailTemplate(actor, args),
         reset_auth_email_template: () => e.resetEmailTemplate(actor, args),
+        set_auth_email_policy: () => e.setEmailPolicy(actor, args),
       }
       return finalize(await run[name]())
     }
@@ -3056,7 +3223,7 @@ export async function dispatchTool(
         summary: clip([
           `${provisioned ? 'Provisioned' : 'Existing'} ${mode === 'READ_ONLY' ? 'read-only' : 'read-write'} Postgres access: role ${c.roleName} @ ${c.host}:${c.port}/${c.database} (TLS required, search_path pinned to ${status.schema}).`,
           mode === 'READ_ONLY'
-            ? 'SELECT-only — safe for inspection, EXPLAIN, BI, and pg_dump. It cannot mutate anything.'
+            ? 'SELECT-only — safe for inspection, EXPLAIN, BI, and pg_dump (run pg_dump with --enable-row-security; the returned pgDumpCommand includes it). It cannot mutate anything.'
             : 'DML + in-schema DDL. Every DDL statement you run is observed as drift — call adopt_external_schema when you finish migrating.',
           'The connection string is in data.connectionString — treat it as a secret (do not write it into code, files, or logs; reference it from env).',
         ].join('\n')),
@@ -3104,7 +3271,7 @@ export async function dispatchTool(
           'schema change made over that connection is observed as drift and adopted by the autonomy loop, ' +
           'which is why it is opt-in. Then call this tool again with mode=READ_WRITE.\n' +
           'Read-only access needs no approval and is available right now via mode=READ_ONLY — it covers ' +
-          'inspection, EXPLAIN, BI and pg_dump. For SCHEMA CHANGES you do not need direct access at all: ' +
+          'inspection, EXPLAIN, BI and pg_dump (with --enable-row-security — the returned pgDumpCommand includes it). For SCHEMA CHANGES you do not need direct access at all: ' +
           'apply_migration takes ordinary DDL and is governed, verified and reversible.',
         data: access,
       })
@@ -3174,16 +3341,28 @@ async function runExecutor(
   // already applied its own approval rule, forward `confirmed:true` so the
   // executor's second gate does not ask again for a confirmation that was
   // already given. The brain's agent loop never sets either flag.
-  const params = (ctx.destructiveConfirmed || ctx.mcpOwnerConfirmed)
+  const confirmedParams = (ctx.destructiveConfirmed || ctx.mcpOwnerConfirmed)
     ? { ...(action.params || {}), confirmed: true }
     : action.params
+  // Deploys and rollbacks write audit rows that name a person. executeAction
+  // has no user argument, so the executors used to record the project owner
+  // acting "from CHAT" even when an org admin approved an agent's call. Name
+  // the real actor and how the call was authorised; set here, after the tool
+  // mapper, so no argument an agent sends can stand in for them (DEP-11).
+  const params = ACTOR_AUDITED_ACTIONS.has(action.action) && ctx.userId
+    ? {
+        ...(confirmedParams || {}),
+        actorUserId: ctx.userId,
+        actorVia: ctx.destructiveConfirmed ? 'APPROVAL' : ctx.mcpOwnerConfirmed ? 'API' : 'CHAT',
+      }
+    : confirmedParams
   const result = await executeAction(
     { ...action, params },
     ctx.projectId,
     ctx.sessionToken,
     0,
     undefined,
-    ctx.allowReplan ?? true,
+    ctx.allowReplan ?? false,
   )
   if (result.success) {
     // Engine-side confirmation gate: stop the loop and surface the prompt to
@@ -3338,6 +3517,7 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'remove_auth_smtp': return 'Removing the auth email sender'
     case 'set_auth_email_template': return `Saving the ${args.kind ?? ''} email template`.replace(/  +/g, ' ')
     case 'reset_auth_email_template': return `Resetting the ${args.kind ?? ''} email template`.replace(/  +/g, ' ')
+    case 'set_auth_email_policy': return 'Saving the auth email policy'
     case 'verify_integration_key': return `Checking the ${args.integrationId ?? ''} key with its provider`.replace(/\s+/g, ' ')
     case 'fix_backend': return `Repairing ${args.target ?? 'backend'}`
     case 'apply_proposal': return 'Applying the recommendation list'
@@ -3367,6 +3547,7 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'get_autonomy_status': return 'Reading autonomy + trust report'
     case 'get_maintenance_ladder': return 'Reading the maintenance ladder'
     case 'set_bucket_public': return `Making ${args.bucketName ?? 'bucket'} ${args.isPublic ? 'public' : 'private'}`
+    case 'set_bucket_policy': return `Setting ${args.bucketName ?? 'bucket'} access policy to ${args.policy ?? '…'}`
     case 'delete_bucket': return `Deleting bucket ${args.bucketName ?? ''}`.trim()
     case 'delete_file': return `Deleting file ${args.path ?? ''}`.trim()
     case 'connect_frontend': return `Connecting frontend ${args.url ?? ''}`.trim()
@@ -3392,7 +3573,6 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'toggle_ai_function': return `${args.active ? 'Enabling' : 'Disabling'} function ${args.name ?? args.functionId ?? ''}`.trim()
     case 'delete_ai_function': return `Deleting function ${args.name ?? args.functionId ?? ''}`.trim()
     case 'delete_cron_job': return `Deleting job ${args.name ?? args.jobId ?? ''}`.trim()
-    case 'set_alert': return `Setting alert: ${args.type ?? ''} > ${args.threshold ?? ''}`
     case 'set_autonomy_level': return `Setting autonomy to ${args.level ?? ''}`
     case 'propose_plan': return 'Proposing a plan'
     case 'ask_user': return 'Asking for clarification'
