@@ -42,7 +42,7 @@ export interface AIAction {
     // API
     | 'GENERATE_API' | 'LIST_APIS'
     // Storage
-    | 'CREATE_BUCKET' | 'DELETE_BUCKET' | 'UPLOAD_FILE' | 'LIST_FILES' | 'LIST_BUCKETS' | 'DELETE_FILE' | 'GENERATE_SIGNED_URL' | 'SET_BUCKET_PUBLIC'
+    | 'CREATE_BUCKET' | 'DELETE_BUCKET' | 'UPLOAD_FILE' | 'LIST_FILES' | 'LIST_BUCKETS' | 'DELETE_FILE' | 'GENERATE_SIGNED_URL' | 'SET_BUCKET_PUBLIC' | 'SET_BUCKET_POLICY'
     // Connect Frontend
     | 'CONNECT_FRONTEND' | 'DISCONNECT_FRONTEND' | 'LIST_CONNECTED_APPS'
     // Deploy
@@ -1495,6 +1495,7 @@ API:
 STORAGE:
 - CREATE_BUCKET - Create storage bucket
 - SET_BUCKET_PUBLIC - Make bucket public/private
+- SET_BUCKET_POLICY - Set a bucket's access policy (public_read | cdn_cacheable | private | owner_only)
 - LIST_BUCKETS - List all storage buckets
 - UPLOAD_FILE - Upload file to bucket
 - LIST_FILES - List files in bucket
@@ -1503,7 +1504,7 @@ STORAGE:
 - GENERATE_SIGNED_URL - Generate signed URL for file
 
 CONNECT FRONTEND:
-- CONNECT_FRONTEND - Connect a frontend URL to this deployed backend (deployment-gated, confirmation-gated)
+- CONNECT_FRONTEND - Connect a frontend URL to this backend (confirmation-gated; works before a first publish)
 - DISCONNECT_FRONTEND - Disconnect a previously-connected frontend (confirmation-gated)
 - LIST_CONNECTED_APPS - List frontends connected to this backend
 
@@ -1541,7 +1542,6 @@ IAM (API KEYS):
 MONITORING:
 - GET_METRICS - Get API metrics
 - GET_ERRORS - Get error logs
-- SET_ALERT - Set monitoring alert
 - GET_USAGE - Get usage statistics
 
 TRIGGERS (event automation — "when X happens, do Y automatically"):
@@ -2119,6 +2119,16 @@ export async function validateAction(
       preview = `Make bucket "${action.params.bucketName}" ${action.params.isPublic ? 'public' : 'private'}`
       break
 
+    case 'SET_BUCKET_POLICY':
+      if (!action.params.bucketName) {
+        errors.push('Bucket name is required')
+      }
+      if (!action.params.policy) {
+        errors.push('policy is required (public_read | cdn_cacheable | private | owner_only)')
+      }
+      preview = `Set bucket "${action.params.bucketName}" access policy to ${action.params.policy}`
+      break
+
     case 'DELETE_BUCKET':
       if (!action.params.bucketName) {
         errors.push('Bucket name is required')
@@ -2159,7 +2169,7 @@ export async function validateAction(
 
     case 'ROLLBACK_DEPLOY':
       preview = action.params.version ? `Rollback to v${action.params.version}` : 'Rollback to previous deployment'
-      warnings.push('Live consumers will see the older schema immediately')
+      warnings.push('Moves the recorded current version only; the live schema, data and functions do not change')
       break
 
     case 'GET_READINESS':
@@ -3317,8 +3327,12 @@ async function executeSingleAction(
     || action.params?.userId || action.params?.path || undefined
   const riskLevel = riskLevelForExecutorAction(action.action)
   if (riskLevel !== 'low' && !action.params?.confirmed) {
+    // The parked finding's id travels back to the caller: without it the
+    // agent had NOTHING to poll — check_approval only knew approval rows —
+    // so a parked action simply vanished from the agent's point of view.
+    let findingId: string | null = null
     try {
-      await queuePendingActionFinding({
+      const finding = await queuePendingActionFinding({
         projectId,
         action: action.action,
         params: action.params ?? {},
@@ -3327,6 +3341,7 @@ async function executeSingleAction(
         source: 'brain-risk',
         reason: `Backenly paused this ${riskLevel}-risk action for your review instead of applying it immediately.`,
       })
+      findingId = (finding as { id?: string } | null)?.id ?? null
     } catch (error) {
       console.error('[ApprovalGate] Failed to queue pending action finding:', error)
     }
@@ -3336,7 +3351,10 @@ async function executeSingleAction(
     // would tell an agent, or the person reading it, something untrue.
     return {
       success: false,
-      message: `⛔ \`${action.action}\`${target ? ` on \`${target}\`` : ''} was not run: it is a ${riskLevel}-risk action and is waiting for the project owner's approval in the Review Queue (Autonomy). Approving it there runs exactly this action.`,
+      message:
+        `⛔ \`${action.action}\`${target ? ` on \`${target}\`` : ''} was not run: it is a ${riskLevel}-risk action and is waiting for the project owner's approval in the Review Queue (Autonomy). Approving it there runs exactly this action.` +
+        (findingId ? ` Poll check_approval with { "id": "${findingId}" } to follow it.` : ''),
+      data: findingId ? { findingId, poll: `check_approval with { "id": "${findingId}" }` } : undefined,
       error: 'APPROVAL_REQUIRED',
     }
   }
@@ -3415,7 +3433,10 @@ async function executeSingleAction(
 
       case 'SET_BUCKET_PUBLIC':
         return await executeSetBucketPublic(action.params, projectId)
-      
+
+      case 'SET_BUCKET_POLICY':
+        return await executeSetBucketPolicy(action.params, projectId)
+
       case 'LIST_BUCKETS':
         return await executeListBuckets(projectId)
       
@@ -6506,6 +6527,50 @@ async function executeSetBucketPublic(params: any, projectId: string): Promise<E
 }
 
 /**
+ * STORAGE: Set a bucket's access policy — the four-value contract the
+ * serving path, upload clamping and the console enforce. set_bucket_public
+ * covers only public_read ↔ private; without this, owner_only and
+ * cdn_cacheable were unreachable from the agent lane.
+ */
+async function executeSetBucketPolicy(params: any, projectId: string): Promise<ExecutionResult> {
+  const { bucketName, policy } = params
+  if (!bucketName) return { success: false, message: 'Bucket name is required' }
+
+  const { ACCESS_POLICIES, policyAllowsPublic, POLICY_LABELS } = await import('@/lib/storage/access-policy')
+  if (!(ACCESS_POLICIES as readonly string[]).includes(policy)) {
+    return {
+      success: false,
+      message: `Unknown access policy "${policy}". The serving path enforces exactly: ${ACCESS_POLICIES.join(', ')}.`,
+      error: 'UNKNOWN_ACCESS_POLICY',
+    }
+  }
+
+  try {
+    const { prisma } = await import('@/lib/db')
+    const bucket = await prisma.storageBucket.findFirst({ where: { name: bucketName, projectId } })
+    if (!bucket) return { success: false, message: `Bucket "${bucketName}" not found` }
+
+    // isPublic stays a derived label, exactly as executeSetBucketPublic
+    // writes it, so the two doors can never leave the pair disagreeing.
+    const updated = await prisma.storageBucket.update({
+      where: { id: bucket.id },
+      data: { accessPolicy: policy, isPublic: policyAllowsPublic(policy) },
+      select: { accessPolicy: true, isPublic: true },
+    })
+    const label = POLICY_LABELS[updated.accessPolicy as keyof typeof POLICY_LABELS]
+    return {
+      success: true,
+      message:
+        `✅ Bucket **"${bucketName}"** access policy is now **${updated.accessPolicy}**` +
+        (label ? ` — ${label.means}` : ''),
+      data: { bucketName, accessPolicy: updated.accessPolicy, isPublic: updated.isPublic },
+    }
+  } catch (error: any) {
+    return { success: false, message: `Failed to set bucket policy: ${error.message}`, error: error.message }
+  }
+}
+
+/**
  * STORAGE: List Buckets
  */
 async function executeListBuckets(projectId: string): Promise<ExecutionResult> {
@@ -6660,7 +6725,7 @@ async function executeListConnectedApps(projectId: string): Promise<ExecutionRes
       return {
         success: true,
         message:
-          '**Connected Frontends:**\n\nNone yet. Try: _"Connect my Replit app at https://app.replit.com/my-app"_\n\nFor anything to connect, your backend must be deployed first.',
+          '**Connected Frontends:**\n\nNone yet. Try: _"Connect my Replit app at https://app.replit.com/my-app"_\n\nConnecting works before a first publish too — the API already answers.',
         data: { apps: [], active: [] },
       }
     }
@@ -6755,6 +6820,14 @@ async function executeCreateKey(params: any, projectId: string): Promise<Executi
   // this tool is asked for most often.
   const serviceRole = params.serviceRole === true
 
+  // Expiry is opt-in (1–3650 days) and echoed in the result; see the note on
+  // the create below for why there is no silent default.
+  const expiresInDays =
+    Number.isFinite(Number(params.expiresInDays)) && Number(params.expiresInDays) >= 1
+      ? Math.min(Math.floor(Number(params.expiresInDays)), 3650)
+      : null
+  const expiresAt = expiresInDays ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000) : null
+
   // ── Branch scoping ─────────────────────────────────────────────────────────
   //
   // Which environment a key reads is a property of the CREDENTIAL, never of the
@@ -6838,7 +6911,12 @@ async function executeCreateKey(params: any, projectId: string): Promise<Executi
         serviceRole,
         branchId,
         role: serviceRole ? 'service' : 'custom',
-        expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000), // 1 year
+        // No silent expiry. Dashboard keys default to never expiring; this
+        // tool used to stamp a hidden 365-day expiry that no message, doc or
+        // console column mentioned — the runtime then refused the key a year
+        // later with nothing having warned anyone. Expiry is opt-in and,
+        // when chosen, said out loud below.
+        expiresAt: expiresAt,
       }
     })
     
@@ -6862,6 +6940,8 @@ async function executeCreateKey(params: any, projectId: string): Promise<Executi
 
 ${safety}
 
+${expiresAt ? `⏳ Expires ${expiresAt.toISOString().slice(0, 10)} (${expiresInDays} days) — the runtime refuses it after that.` : 'No expiry: the key works until it is revoked or rotated.'}
+
 **Copy this key (shown once):**
 \`\`\`
 ${keyValue}
@@ -6873,6 +6953,7 @@ ${keyValue}
         publishable: !serviceRole,
         header: 'x-api-key',
         safeInBrowser: !serviceRole,
+        expiresAt: expiresAt ? expiresAt.toISOString() : null,
       }
     }
   } catch (error: any) {
@@ -6999,6 +7080,22 @@ async function executeEnableAuth(projectId: string): Promise<ExecutionResult> {
 async function executeEnableRealtime(params: Record<string, any>, projectId: string): Promise<ExecutionResult> {
   try {
     const tableName: string | undefined = params?.table || params?.tableName
+
+    // Enabling is PER TABLE. Without a name this used to fall through to the
+    // install-on-every-table branch, so `realtime { action: "enable" }` from
+    // an agent that forgot the argument silently started streaming the whole
+    // project. The all-tables branch stays reachable for internal callers that
+    // pass allTables: true; the agent's tool forwards only tableName, so the
+    // refusal names only the call an agent can make.
+    if (!tableName && params?.allTables !== true) {
+      return {
+        success: false,
+        message:
+          'Realtime is enabled per table: pass tableName, e.g. realtime { "action": "enable", "tableName": "posts" }, ' +
+          'once for each table that should stream.',
+        error: 'TABLE_NAME_REQUIRED',
+      }
+    }
 
     // ── Install actual PostgreSQL NOTIFY triggers ──────────────────────────
     const { installRealtimeTrigger, installRealtimeTriggersForAllTables, listTablesWithRealtimeTriggers } =
@@ -7273,8 +7370,8 @@ async function executeGetRealtimeStatus(projectId: string): Promise<ExecutionRes
       return {
         success: true,
         message:
-          'No workspace tables yet — realtime has nothing to stream. Create a table first; ' +
-          'NOTIFY triggers are installed automatically as tables are built.',
+          'No workspace tables yet — realtime has nothing to stream. Realtime is opt-in per table: ' +
+          'after creating a table, call realtime { "action": "enable", "tableName": "<table>" }.',
         data: { ...status, healthy: true },
       }
     }
@@ -7535,11 +7632,13 @@ async function executeListUsers(projectId: string, params?: any): Promise<Execut
     const { executeWithUserContext } = await import('@/lib/services/workspace-rls')
     const orderBy = createdCol ? `ORDER BY "${createdCol}" DESC` : ''
     const rows = await executeWithUserContext<any>(
+      projectId,
       '', true,
       `SELECT ${select.join(', ')} FROM "${schemaName}"."users" ${orderBy} LIMIT ${limit}`,
     )
 
     const countRows = await executeWithUserContext<{ count: bigint }>(
+      projectId,
       '', true,
       `SELECT COUNT(*)::bigint AS count FROM "${schemaName}"."users"`,
     )
@@ -7625,6 +7724,7 @@ async function executeBlockUser(params: any, projectId: string): Promise<Executi
     const { executeWithUserContext } = await import('@/lib/services/workspace-rls')
     const where = identifier === 'email' ? `"email" = $1` : `"id"::text = $1`
     const updated = await executeWithUserContext<{ id: string }>(
+      projectId,
       '',
       true,
       `UPDATE "${schemaName}"."users" SET is_blocked = TRUE WHERE ${where} RETURNING id`,
@@ -7669,6 +7769,7 @@ async function executeResetPassword(params: any, projectId: string): Promise<Exe
     const identifier = email ? 'email' : 'id'
     const paramValue = String(email || userId)
     const users = await executeWithUserContext<{ id: string; email: string | null }>(
+      projectId,
       '',
       true,
       `SELECT id, email FROM "${schemaName}"."users" WHERE "${identifier}" = $1 LIMIT 1`,
@@ -7756,6 +7857,7 @@ async function executeUnblockUser(params: any, projectId: string): Promise<Execu
     const { executeWithUserContext } = await import('@/lib/services/workspace-rls')
     const where = identifier === 'email' ? `"email" = $1` : `"id"::text = $1`
     const updated = await executeWithUserContext<{ id: string }>(
+      projectId,
       '',
       true,
       `UPDATE "${schemaName}"."users" SET is_blocked = FALSE WHERE ${where} RETURNING id`,
@@ -8040,59 +8142,22 @@ async function executeGetUsage(projectId: string): Promise<ExecutionResult> {
  * MONITORING: Set Alert — persists alert config as JSON in project.activeIntegrations
  * Stored under the `_monitoring_alerts` key so no schema migration is needed.
  */
-async function executeSetAlert(params: any, projectId: string): Promise<ExecutionResult> {
-  const { metric, threshold, operator = 'gt', channel = 'in_app', name } = params ?? {}
-
-  if (!metric || threshold === undefined) {
-    return {
-      success: false,
-      message: 'Alert requires metric and threshold. Example: { metric: "error_rate", threshold: 5, operator: "gt" }',
-    }
-  }
-
-  try {
-    const { prisma } = await import('@/lib/db')
-
-    const project = await prisma.project.findUnique({
-      where: { id: projectId },
-      select: { activeIntegrations: true },
-    })
-
-    const existing = (project?.activeIntegrations as Record<string, any>) ?? {}
-    const alerts: any[] = existing._monitoring_alerts ?? []
-
-    const newAlert = {
-      id: `alert_${Date.now()}`,
-      name: name || `${metric} alert`,
-      metric,
-      threshold: Number(threshold),
-      operator,   // 'gt' | 'lt' | 'gte' | 'lte'
-      channel,    // 'in_app' | 'email' | 'webhook'
-      enabled: true,
-      createdAt: new Date().toISOString(),
-    }
-
-    // Replace existing alert for same metric (idempotent)
-    const updated = alerts.filter(a => a.metric !== metric)
-    updated.push(newAlert)
-
-    await prisma.project.update({
-      where: { id: projectId },
-      data: { activeIntegrations: { ...existing, _monitoring_alerts: updated } },
-    })
-
-    const opLabel = operator === 'gt' ? 'exceeds' : operator === 'lt' ? 'drops below' : 'reaches'
-    return {
-      success: true,
-      message: `✅ Alert set: notify when ${metric} ${opLabel} ${threshold}. Active on Monitoring tab.`,
-      data: newAlert,
-    }
-  } catch (error: any) {
-    return {
-      success: false,
-      message: `Failed to save alert: ${error.message}`,
-      error: error.message,
-    }
+async function executeSetAlert(_params: any, _projectId: string): Promise<ExecutionResult> {
+  // This used to store the alert under project.activeIntegrations and answer
+  // with a green set-and-active receipt — but NOTHING evaluates those
+  // rows: no cron, no reconciler pass, no console surface reads them. The
+  // agent was told a watchdog existed that could never bark, which is worse
+  // than having none. The MCP door already removed its set_alert action and
+  // the brain no longer offers the tool; this refusal covers any caller that
+  // still carries the action name. It returns when an evaluator exists.
+  return {
+    success: false,
+    message:
+      'Alerts are not available yet: nothing evaluates stored alert rules, so setting one would ' +
+      'claim a watchdog that can never fire. Watch the backend directly instead — ' +
+      'monitoring { "action": "metrics" } and { "action": "errors" } — or rely on the autonomy ' +
+      'loop, which already surfaces failing endpoints on the Autonomy page.',
+    error: 'ALERTS_NOT_EVALUATED',
   }
 }
 
@@ -9638,6 +9703,17 @@ async function executeCreateTrigger(params: any, projectId: string): Promise<Exe
     return { success: false, message: 'name, sourceTable, event, and actionType are required' }
   }
 
+  // A webhook trigger without a destination used to be CREATED and reported as
+  // "calls your webhook at `undefined`"; every later matching write then threw
+  // 'webhook trigger requires webhookUrl' and logged a DEAD delivery. Refuse
+  // at creation, where the caller can still fix it.
+  if (actionType === 'webhook' && !(typeof webhookUrl === 'string' && /^https?:\/\//i.test(webhookUrl.trim()))) {
+    return {
+      success: false,
+      message: 'A webhook trigger needs webhookUrl — the http(s) endpoint it calls. Pass webhookUrl, or use create_webhook for a signed row webhook.',
+    }
+  }
+
   try {
     const { prisma } = await import('@/lib/db')
     const { createTrigger } = await import('@/lib/services/trigger-service')
@@ -10097,19 +10173,64 @@ async function executeRotateKey(params: any, projectId: string): Promise<Executi
 async function executeSetKeyPermissions(params: any, projectId: string): Promise<ExecutionResult> {
   const { keyId, permissions } = params
   if (!keyId) return { success: false, message: 'keyId is required' }
-  if (!Array.isArray(permissions)) return { success: false, message: 'permissions must be an array (e.g. ["read", "write"])' }
+  if (!Array.isArray(permissions) || permissions.length === 0) {
+    return { success: false, message: 'permissions must be a non-empty array (e.g. ["read", "write"])' }
+  }
+
+  // The runtime's whole vocabulary. Anything else would be written verbatim
+  // and silently match no gate — a key that LOOKS narrowed and isn't.
+  const KEY_PERMISSION_VOCABULARY = ['read', 'write', 'ai-only', 'admin']
+  const unknown = permissions.filter((p: unknown) => !KEY_PERMISSION_VOCABULARY.includes(String(p)))
+  if (unknown.length > 0) {
+    return {
+      success: false,
+      message:
+        `Unknown permission${unknown.length === 1 ? '' : 's'}: ${unknown.join(', ')}. ` +
+        `The runtime reads exactly: read, write, ai-only. ('admin' passes every gate and is not grantable here.)`,
+      error: 'UNKNOWN_PERMISSION',
+    }
+  }
 
   try {
     const { prisma } = await import('@/lib/db')
     const key = await prisma.apiKey.findFirst({ where: { id: keyId, projectId } })
     if (!key) return { success: false, message: `API key "${keyId}" not found` }
 
+    // A service-role key's access is not permission-driven: the runtime
+    // treats serviceRole as operator-grade before any permission is read.
+    // "Narrowing" one here would change nothing while reporting success.
+    if (key.serviceRole) {
+      return {
+        success: false,
+        message:
+          `\`${key.keyPrefix}...\` is a service-role key — its access does not come from the ` +
+          `permissions array, so editing it here would change nothing. Rotate or revoke it instead, ` +
+          `or create a publishable key with the scopes you want.`,
+        error: 'SERVICE_ROLE_KEY_NOT_PERMISSION_DRIVEN',
+      }
+    }
+
+    // 'admin' makes a key pass EVERY permission gate (server/lib/auth.ts) —
+    // granting it is privilege escalation, not scope adjustment, and it is
+    // the project owner's click to make in Settings, not a tool call's.
+    if (permissions.includes('admin') && !key.permissions.includes('admin')) {
+      return {
+        success: false,
+        message:
+          `Refused: adding 'admin' makes \`${key.keyPrefix}...\` pass every permission gate. ` +
+          `That escalation is the project owner's decision — grant it from Settings → API keys, ` +
+          `or create a service-role key deliberately with create_api_key { "serviceRole": true }.`,
+        error: 'ADMIN_ESCALATION_REQUIRES_HUMAN',
+      }
+    }
+
+    const before = key.permissions
     await prisma.apiKey.update({ where: { id: keyId }, data: { permissions } })
 
     return {
       success: true,
-      message: `✅ API key \`${key.keyPrefix}...\` permissions updated to: ${permissions.join(', ')}`,
-      data: { keyId, permissions },
+      message: `✅ API key \`${key.keyPrefix}...\` permissions updated: ${before.join(', ') || '(none)'} → ${permissions.join(', ')}`,
+      data: { keyId, permissions, previousPermissions: before },
     }
   } catch (error: any) {
     return { success: false, message: `Failed to set permissions: ${error.message}`, error: error.message }
@@ -10437,7 +10558,7 @@ async function executeCreateAiFunction(params: any, projectId: string): Promise<
     // This prevents the LLM from generating internal-sounding names like
     // "describe_ai_function_with_trigger" when the name-generation call gets confused.
     const suppliedName = typeof params.name === 'string' && params.name.trim()
-      ? params.name.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_').replace(/__+/g, '_').replace(/^_|_$/g, '').slice(0, 50)
+      ? params.name.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_').replace(/__+/g, '_').replace(/^[_-]|[_-]$/g, '').slice(0, 50)
       : null
 
     const generated = await generateFunctionCode(description, triggerType, triggerTable || null, projectId)
@@ -10841,6 +10962,11 @@ async function executeDeleteAiFunction(params: any, projectId: string): Promise<
 
     await prisma.aiFunction.delete({ where: { id: fn.id } })
 
+    // Deleting the last row-event subscriber takes the capture trigger off the
+    // tables, so an unused capture costs nothing.
+    const { syncCaptureForFunctionChange } = await import('@/lib/webhooks/capture')
+    await syncCaptureForFunctionChange(projectId, fn.triggerType)
+
     return {
       success: true,
       message: `✅ AI function \`${fn.name}\` deleted.`,
@@ -10869,6 +10995,11 @@ async function executeToggleAiFunction(params: any, projectId: string): Promise<
 
     const newStatus = active ? 'active' : 'inactive'
     await prisma.aiFunction.update({ where: { id: fn.id }, data: { status: newStatus } })
+
+    // A row-event function going on or off changes what the database-level
+    // capture must record; the sync derives the answer from the rows.
+    const { syncCaptureForFunctionChange } = await import('@/lib/webhooks/capture')
+    await syncCaptureForFunctionChange(projectId, fn.triggerType)
 
     return {
       success: true,
@@ -10964,11 +11095,11 @@ async function executeRollbackToVersion(params: any, projectId: string): Promise
  *   openai/anthropic → generates /ai/chat and /ai/embed endpoints with rate limiting
  */
 async function executeStoreIntegrationKey(params: any, projectId: string): Promise<ExecutionResult> {
-  const { integrationId, apiKey, webhookSecret } = params
-  if (!integrationId || !apiKey) {
+  const { integrationId: rawIntegrationId, apiKey, webhookSecret } = params
+  if (!rawIntegrationId || !apiKey) {
     // Friendly pending state — never a hard error. Show inline key prompt with skip option.
-    const providerName = integrationId
-      ? integrationId.charAt(0).toUpperCase() + integrationId.slice(1)
+    const providerName = rawIntegrationId
+      ? rawIntegrationId.charAt(0).toUpperCase() + rawIntegrationId.slice(1)
       : 'external provider'
     const KEY_EXAMPLES: Record<string, string> = {
       stripe: 'sk_live_... or sk_test_...',
@@ -10981,7 +11112,7 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
       runway: 'rw_...',
       luma: 'luma_...',
     }
-    const example = integrationId ? (KEY_EXAMPLES[integrationId.toLowerCase()] ?? `your ${providerName} API key`) : 'your API key'
+    const example = rawIntegrationId ? (KEY_EXAMPLES[rawIntegrationId.toLowerCase()] ?? `your ${providerName} API key`) : 'your API key'
     return {
       success: false,
       message: [
@@ -10994,6 +11125,28 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
       error: 'CREDENTIALS_PENDING',
     }
   }
+
+  // ── The id must name a provider the runtime actually serves ───────────────
+  //
+  // This used to store ANY id verbatim: an unknown id ("hubspot") was filed,
+  // marked connected, and promised a `ctx.integrations.hubspot.*` surface that
+  // does not exist; a capitalised id ("Stripe") was stored under a key the
+  // runtime, the receiver and the console all look up lowercased, so the
+  // credential existed and nothing could find it.
+  const { resolveProviderId, allProviderIds } = await import('@/lib/services/ai-functions/integration-registry')
+  const canonicalId = resolveProviderId(String(rawIntegrationId).trim())
+  if (!canonicalId) {
+    return {
+      success: false,
+      message:
+        `"${rawIntegrationId}" is not an integration this runtime serves. ` +
+        `Known providers: ${allProviderIds().sort().join(', ')}.`,
+      error: 'UNKNOWN_INTEGRATION',
+    }
+  }
+  // Every reference below — vault rows, auto-wiring, activeIntegrations, the
+  // ctx.integrations surface named in the receipt — uses the CANONICAL id.
+  const integrationId = canonicalId
 
   // ── Stripe without a webhook secret is a DEGRADED connect, not a refusal ───
   //
@@ -11008,11 +11161,11 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
   // Connect the key, do the work that does not need the secret, and say plainly
   // which capability is off until the real secret arrives. A missing credential
   // is a known gap; a fabricated one is a lie in the vault.
-  const webhookSecretPending = integrationId === 'stripe' && !webhookSecret
+  const webhookSecretPending = canonicalId === 'stripe' && !webhookSecret
 
   try {
     const { storeIntegrationKey } = await import('@/lib/services/integrationKeyStore')
-    const status = await storeIntegrationKey(projectId, integrationId, apiKey)
+    const status = await storeIntegrationKey(projectId, canonicalId, String(apiKey).trim())
     const keyValidationNote =
       status.verification === 'verified' ? ''
       : status.verification === 'unreachable' ? `\n\n⚠ ${status.verificationDetail}`
@@ -11022,6 +11175,20 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
     // there is no branch here that writes a value the caller did not pass.
     if (webhookSecret) {
       await storeIntegrationKey(projectId, `${integrationId}_webhook_secret`, webhookSecret)
+    }
+
+    // OneSignal needs TWO values: the REST key (stored above) and the App ID.
+    // Only the chat-only enable_push_notifications tool could store the App
+    // ID, so the typed door could connect OneSignal and still never send a
+    // push. `appId` rides the same connect call now.
+    let oneSignalAppIdPending = false
+    if (integrationId === 'onesignal') {
+      if (params.appId) {
+        await storeIntegrationKey(projectId, 'onesignal_app_id', String(params.appId).trim())
+      } else {
+        const { hasIntegrationKey } = await import('@/lib/services/integrationKeyStore')
+        oneSignalAppIdPending = !(await hasIntegrationKey(projectId, 'onesignal_app_id'))
+      }
     }
 
     const autoWiredSteps: string[] = []
@@ -11053,47 +11220,51 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
         if (col2.success) autoWiredSteps.push(`✅ Added \`status\` to \`${tableName}\``)
       }
 
-      // Generate POST /checkout/session endpoint
-      const { executeGenerateFunction } = await import('@/lib/ai/function-generator')
-
-      const checkoutResult = await executeGenerateFunction(
+      // SANDBOX functions, not route modules: ctx.integrations only exists in
+      // the sandbox runtime, and route modules deliberately cannot reach stored
+      // provider keys (their curated env withholds them). The old auto-wire
+      // generated route modules whose own description told the model to call a
+      // ctx that does not exist there — every generated endpoint was dead on
+      // arrival (ReferenceError or an empty key).
+      const checkoutResult = await executeCreateAiFunction(
         {
-          functionName: 'stripe-checkout-session',
+          name: 'stripe-checkout-session',
+          triggerType: 'manual',
           description: [
             'Create a Stripe Checkout session.',
-            'Accept { lineItems, successUrl, cancelUrl, customerEmail? } in the request body.',
+            'Read { lineItems, successUrl, cancelUrl, customerEmail? } from event.data.',
             'Call ctx.integrations.stripe.createCheckoutSession({ lineItems, successUrl, cancelUrl, customerEmail }) — it returns { id, url }.',
             'Each lineItem is { price: "price_xxx", quantity } or { priceData: { currency, unitAmount, productName, recurringInterval? }, quantity }.',
-            'Require authentication — reject unauthenticated requests with 401.',
+            'If event.data has no lineItems, return { error: "lineItems required" } without calling Stripe.',
             'Return { checkoutUrl: session.url, sessionId: session.id }.',
           ].join(' '),
-          method: 'POST',
         },
         projectId,
       )
-      if (checkoutResult.success) autoWiredSteps.push('✅ Generated `POST /checkout/session`')
+      if (checkoutResult.success) autoWiredSteps.push(`✅ Generated \`POST /api/v1/${projectId}/fn/stripe-checkout-session\``)
 
-      // Generate the Stripe webhook handler.
-      // The platform receiver at POST /api/v1/{projectId}/webhooks/stripe already
-      // verifies the Stripe-Signature header and runs deterministic order/subscription
-      // updates BEFORE this function fires — so this function works on an
-      // already-verified event.data payload and must NOT re-verify signatures.
-      const webhookResult = await executeGenerateFunction(
+      // The Stripe webhook handler: triggerType on_webhook / triggerTable
+      // 'stripe' — the ONLY shape the platform receiver fires. It used to be
+      // stored as a 'manual' route module, which the receiver never fires
+      // (functionsTriggered: 0 on every delivery) while readiness reported the
+      // integration Complete.
+      const webhookResult = await executeCreateAiFunction(
         {
-          functionName: 'stripe-webhook',
+          name: 'stripe-webhook',
+          triggerType: 'on_webhook',
+          triggerTable: 'stripe',
           description: [
             'Process a verified Stripe webhook event delivered in event.data.',
             'The platform webhook receiver has already verified the signature — do not re-verify.',
             'Read event.data.type for the Stripe event type and event.data.data.object for the payload.',
-            'On checkout.session.completed: update the matching order row status to "paid".',
-            'On payment_intent.succeeded: log the payment.',
+            'On checkout.session.completed: update the matching order row status to "paid" via ctx.db.',
+            'On payment_intent.succeeded: ctx.log the payment.',
             'Return { handled: true } for recognised events.',
           ].join(' '),
-          method: 'POST',
         },
         projectId,
       )
-      if (webhookResult.success) autoWiredSteps.push('✅ Generated `stripe-webhook` handler')
+      if (webhookResult.success) autoWiredSteps.push('✅ Generated `stripe-webhook` handler (fires on verified Stripe deliveries)')
     }
 
     // ── PROMPT 2.2: Email triggers ──────────────────────────────────────────
@@ -11138,45 +11309,42 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
 
     // ── PROMPT 2.3: AI route generation ────────────────────────────────────
     if (integrationId === 'openai' || integrationId === 'anthropic') {
-      const { executeGenerateFunction } = await import('@/lib/ai/function-generator')
-
-      // POST /ai/chat — rate-limited, auth-protected
-      const chatResult = await executeGenerateFunction(
+      // Sandbox functions: ctx.integrations.<id>.complete/embed only exist in
+      // the sandbox runtime (see the Stripe note above).
+      const chatResult = await executeCreateAiFunction(
         {
-          functionName: `${integrationId}-chat`,
+          name: `${integrationId}-chat`,
+          triggerType: 'manual',
           description: [
-            `AI chat endpoint backed by ${integrationId}.`,
-            'Accept { prompt, systemPrompt?, maxTokens? } in the request body.',
+            `AI chat backed by ${integrationId}.`,
+            'Read { prompt, systemPrompt?, maxTokens? } from event.data.',
             `Call ctx.integrations.${integrationId}.complete(prompt, maxTokens, systemPrompt) — it returns the assistant reply as a string.`,
-            'Apply rate limiting of 10 requests per minute per authenticated user.',
-            'Require authentication — reject unauthenticated requests with 401.',
+            'If event.data has no prompt, return { error: "prompt required" } without calling the provider.',
             'Return { reply }.',
           ].join(' '),
-          method: 'POST',
         },
         projectId,
       )
-      if (chatResult.success) autoWiredSteps.push('✅ Generated `POST /ai/chat` (rate-limited, auth-protected)')
+      if (chatResult.success) autoWiredSteps.push(`✅ Generated \`POST /api/v1/${projectId}/fn/${integrationId}-chat\``)
 
-      // POST /ai/embed — OpenAI only. Anthropic has no embeddings API, so an
+      // Embeddings — OpenAI only. Anthropic has no embeddings API, so an
       // anthropic-embed function would be unrunnable — never generate it.
       if (integrationId === 'openai') {
-        const embedResult = await executeGenerateFunction(
+        const embedResult = await executeCreateAiFunction(
           {
-            functionName: 'openai-embed',
+            name: 'openai-embed',
+            triggerType: 'manual',
             description: [
-              'Text embedding endpoint backed by OpenAI.',
-              'Accept { text } in the request body.',
+              'Text embedding backed by OpenAI.',
+              'Read { text } from event.data.',
               'Call ctx.integrations.openai.embed(text) — it returns a number[] embedding vector.',
-              'Apply rate limiting of 20 requests per minute per authenticated user.',
-              'Require authentication — reject unauthenticated requests with 401.',
+              'If event.data has no text, return { error: "text required" } without calling the provider.',
               'Return { embedding }.',
             ].join(' '),
-            method: 'POST',
           },
           projectId,
         )
-        if (embedResult.success) autoWiredSteps.push('✅ Generated `POST /ai/embed` (rate-limited, auth-protected)')
+        if (embedResult.success) autoWiredSteps.push(`✅ Generated \`POST /api/v1/${projectId}/fn/openai-embed\``)
       }
     }
 
@@ -11242,15 +11410,21 @@ async function executeStoreIntegrationKey(params: any, projectId: string): Promi
       ? `\n\n**Auto-wired:**\n${autoWiredSteps.join('\n')}`
       : ''
 
+    const appIdGap = oneSignalAppIdPending
+      ? `\n\n⚠ **Push sending is NOT active yet.** OneSignal also needs your App ID: ` +
+        `call integrations { "action": "connect", "integrationId": "onesignal", "apiKey": "<same REST key>", "appId": "<your App ID>" }.`
+      : ''
+
     return {
       success: true,
-      message: `${integrationId} connected. Key stored securely (${status.maskedKey}).${keyValidationNote}${webhookUrl}${webhookGap}${autoWiredMsg}\n\nAI functions can now use \`ctx.integrations.${integrationId}.*\` to call ${integrationId} APIs.`,
+      message: `${integrationId} connected. Key stored securely (${status.maskedKey}).${keyValidationNote}${webhookUrl}${webhookGap}${appIdGap}${autoWiredMsg}\n\nAI functions can now use \`ctx.integrations.${integrationId}.*\` to call ${integrationId} APIs.`,
       data: {
         integrationId,
         maskedKey: status.maskedKey,
         verification: status.verification,
         verificationDetail: status.verificationDetail,
         webhookSecretPending,
+        oneSignalAppIdPending,
         autoWired: autoWiredSteps,
       },
     }
@@ -11340,17 +11514,51 @@ async function executeListIntegrationKeys(projectId: string): Promise<ExecutionR
  * params: { integrationId: string }
  */
 async function executeRemoveIntegrationKey(params: any, projectId: string): Promise<ExecutionResult> {
-  const { integrationId } = params
-  if (!integrationId) return { success: false, message: 'integrationId is required' }
+  const { integrationId: rawId } = params
+  if (!rawId) return { success: false, message: 'integrationId is required' }
 
   try {
     const { prisma: db } = await import('@/lib/db')
+    // Same canonical resolution as connect, so "Stripe" removes what
+    // "stripe" stored; an unknown id removes nothing and says so.
+    const { resolveProviderId } = await import('@/lib/services/ai-functions/integration-registry')
+    const integrationId = resolveProviderId(String(rawId).trim()) ?? String(rawId).trim().toLowerCase()
+
     await db.projectIntegrationKey.deleteMany({
       where: { projectId, integrationId: { startsWith: integrationId } },
     })
+
+    // The console reads project.activeIntegrations[id].enabled, which only
+    // the CONNECT paths wrote — so a disconnected provider kept rendering
+    // "Connected" and counting toward "N of 5 connected" forever.
+    try {
+      const proj = await db.project.findUnique({
+        where: { id: projectId },
+        select: { activeIntegrations: true },
+      })
+      const active = (proj?.activeIntegrations as Record<string, any>) ?? {}
+      if (active[integrationId]) {
+        await db.project.update({
+          where: { id: projectId },
+          data: {
+            activeIntegrations: {
+              ...active,
+              [integrationId]: {
+                ...active[integrationId],
+                enabled: false,
+                disconnectedAt: new Date().toISOString(),
+              },
+            },
+          },
+        })
+      }
+    } catch (err: any) {
+      console.warn('[executeRemoveIntegrationKey] activeIntegrations sync failed (non-fatal):', err?.message)
+    }
+
     return {
       success: true,
-      message: `${integrationId} disconnected. Key removed from vault.`,
+      message: `${integrationId} disconnected. Key removed from vault and the dashboard no longer shows it as connected.`,
     }
   } catch (error: any) {
     return { success: false, message: `Failed to remove key: ${error.message}` }
@@ -11361,42 +11569,11 @@ async function executeRemoveIntegrationKey(params: any, projectId: string): Prom
 // BACKGROUND JOBS / CRON SCHEDULING
 // ============================================================================
 
-/**
- * Translate human-readable schedule to a cron expression.
- * e.g. "every day at 9am" → "0 9 * * *"
- */
-function toCronExpression(schedule: string): string {
-  const s = schedule.toLowerCase().trim()
-
-  // Already a cron expression (5 parts)
-  if (/^[\d\*\/\-,]+ [\d\*\/\-,]+ [\d\*\/\-,]+ [\d\*\/\-,]+ [\d\*\/\-,]+$/.test(s)) {
-    return s
-  }
-
-  // Common patterns
-  if (s.includes('every minute') || s === 'minutely') return '* * * * *'
-  if (s.includes('every 5 min')) return '*/5 * * * *'
-  if (s.includes('every 15 min')) return '*/15 * * * *'
-  if (s.includes('every 30 min')) return '*/30 * * * *'
-  if (s.includes('every hour') || s === 'hourly') return '0 * * * *'
-  if (s.includes('every day') || s === 'daily') {
-    const hourMatch = s.match(/at (\d+)(am|pm)?/)
-    if (hourMatch) {
-      let hour = parseInt(hourMatch[1])
-      if (hourMatch[2] === 'pm' && hour < 12) hour += 12
-      if (hourMatch[2] === 'am' && hour === 12) hour = 0
-      return `0 ${hour} * * *`
-    }
-    return '0 9 * * *' // default 9am
-  }
-  if (s.includes('every week') || s === 'weekly') return '0 9 * * 1' // Monday 9am
-  if (s.includes('every month') || s === 'monthly') return '0 9 1 * *' // 1st of month 9am
-  if (s.includes('midnight')) return '0 0 * * *'
-  if (s.includes('noon')) return '0 12 * * *'
-
-  // Default: daily at 9am
-  return '0 9 * * *'
-}
+// Schedule parsing lives in lib/services/cron-expression.ts, shared with the
+// runner that fires the jobs. The parser that used to live here defaulted every
+// phrase it did not recognise to daily 09:00 UTC — including the console's own
+// example "Every night at 02:00" — and the job then silently ran seven hours
+// late. An unrecognised schedule is now a refusal, never a default.
 
 /**
  * CREATE_CRON_JOB: Create a scheduled background job (AI function + schedule)
@@ -11413,7 +11590,17 @@ async function executeCreateCronJob(params: any, projectId: string): Promise<Exe
   if (!schedule) return { success: false, message: 'schedule is required (e.g. "every day at 9am", "0 9 * * *")' }
 
   try {
-    const cronExpr = toCronExpression(schedule)
+    const { scheduleToCron } = await import('@/lib/services/cron-expression')
+    const cronExpr = scheduleToCron(schedule)
+    if (!cronExpr) {
+      return {
+        success: false,
+        message:
+          `Could not understand the schedule "${schedule}", so no job was created. ` +
+          `Pass a five-field cron expression (e.g. "0 2 * * *" for 02:00 UTC daily, "0 9 * * 1-5" for weekdays at 09:00 UTC) ` +
+          `or a phrase like "every 10 minutes", "every day at 21:30", "every weekday at 8am", "every monday at 9am". All times are UTC.`,
+      }
+    }
     const { generateFunctionCode } = await import('@/lib/services/ai-functions/generator')
     const { prisma: db } = await import('@/lib/db')
 
@@ -11443,7 +11630,7 @@ async function executeCreateCronJob(params: any, projectId: string): Promise<Exe
 
     return {
       success: true,
-      message: `Scheduled job created: "${fn.name}"\n\nSchedule: ${schedule} (${cronExpr})\nDescription: ${description}\n\nThe job will run automatically on the configured schedule.`,
+      message: `Scheduled job created: "${fn.name}"\n\nSchedule: ${schedule} (${cronExpr}, UTC)\nDescription: ${description}\n\nThe job will run automatically on the configured schedule.`,
       data: { functionId: fn.id, name: fn.name, cron: cronExpr },
     }
   } catch (error: any) {
@@ -13262,7 +13449,10 @@ async function executeRotateWebhookSecret(params: any, projectId: string): Promi
         `**New secret** (shown once — save it now):\n\n\`${newSecret}\`\n\n` +
         `Future deliveries to \`${trigger.webhookUrl}\` are signed with this secret as \`X-Backenly-Signature: sha256=<hmac>\`. ` +
         `Verify in your receiver before trusting any payload.`,
-      data: { triggerId: trigger.id, triggerName: trigger.name },
+      // The docs promise the secret in data.secret — an agent updating a
+      // receiver should not have to parse it out of prose. Shown once, as
+      // the message says; it is never readable again.
+      data: { triggerId: trigger.id, triggerName: trigger.name, secret: newSecret },
     }
   } catch (error: any) {
     return { success: false, message: `Failed to rotate webhook secret: ${error.message}`, error: error.message }
@@ -13292,10 +13482,14 @@ async function executeSendPush(params: any, projectId: string): Promise<Executio
       getIntegrationKey(projectId, 'onesignal_app_id'),
     ])
     if (!restApiKey || !appId) {
+      const missing = !restApiKey && !appId ? 'REST API Key and App ID' : !restApiKey ? 'REST API Key' : 'App ID'
       return {
         success: false,
         message:
-          `OneSignal isn't connected yet. Say "connect OneSignal" and paste your **App ID** and **REST API Key** (both on onesignal.com → Settings → Keys & IDs).`,
+          `OneSignal isn't fully connected: the ${missing} is missing (both are on onesignal.com → Settings → Keys & IDs). ` +
+          `Connect with the exact call: integrations { "action": "connect", "integrationId": "onesignal", ` +
+          `"apiKey": "<REST API Key>", "appId": "<App ID>" }.`,
+        error: 'ONESIGNAL_NOT_CONNECTED',
       }
     }
 

@@ -15,11 +15,13 @@
 import { Router } from 'express'
 import type { Request, Response } from 'express'
 import { prisma } from '@/lib/db'
+import { isRegionError, workspaceRawClient } from '@/lib/data-plane/regional'
 import { verify } from 'jsonwebtoken'
 import { enforceRateLimitByKeyId } from '../lib/auth'
 import { resolveJwtSecret } from '@/lib/services/jwtSecretManager'
 import { hashApiKey, resolveEndUserFromToken, crossEnvironmentUserToken } from '../lib/end-user-identity'
 import { handleViaPostgrest } from './postgrest-handler'
+import { isFunctionSwitchedOff } from '@/lib/services/ai-functions/status'
 import { v1NotFoundBody } from '@/lib/api/v1/route-not-found'
 import {
   SERVICE_ROLE_IN_BROWSER,
@@ -204,6 +206,15 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
         ? { id: key.branch.id, name: key.branch.name, schemaName: key.branch.schemaName }
         : null
       const endUser = await resolveEndUserFromToken(key.projectId, userToken, branch)
+      if (endUser === 'blocked') {
+        // The promised behavior of block_end_user: a 403 on the next
+        // request, not a silent downgrade to the anonymous identity.
+        return {
+          success: false,
+          error: 'This account has been blocked by the project owner.',
+          code: 'END_USER_BLOCKED',
+        }
+      }
       if (endUser) {
         endUserId = endUser.userId
         userRole = endUser.role
@@ -289,9 +300,13 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
         if (!decoded?.userId) return { success: false, error: 'Invalid token', code: 'INVALID_TOKEN' }
         // Reject tokens revoked via /auth/logout.
         if (decoded.jti) {
+          // The blacklist is in the project's database, in its region.
+          // Resolved outside the catch below, which reads any failure as "not
+          // revoked": a region this process cannot reach must not be.
+          const db = await workspaceRawClient(decoded.projectId)
           try {
             const schemaName = `workspace_${decoded.projectId}`
-            const rows = await prisma.$queryRawUnsafe<{ jti: string }[]>(
+            const rows = await db.$queryRawUnsafe<{ jti: string }[]>(
               `SELECT jti FROM "${schemaName}"."_token_blacklist" WHERE jti = $1 LIMIT 1`,
               decoded.jti,
             )
@@ -326,7 +341,9 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
       })
       if (!user || user.projects.length === 0) return { success: false, error: 'No project found for user', code: 'NO_PROJECT' }
       return { success: true, projectId: user.projects[0].id, userId: user.id, isServiceRole: true }
-    } catch {
+    } catch (err) {
+      // An unreachable region is the server's fault, not the token's.
+      if (isRegionError(err)) throw err
       return { success: false, error: 'Invalid or expired token', code: 'INVALID_TOKEN' }
     }
   }
@@ -460,11 +477,14 @@ async function handleDynamicRequest(req: Request, res: Response) {
       // may well be the one that works — which is also the only way it can
       // recover on its own.
       //
-      // 'disabled' remains a real refusal: that one is a deliberate act, not a
-      // side effect of a runtime error.
-      if (fn.status === 'disabled' || fn.status === 'deleted') {
+      // A deliberate OFF remains a real refusal: that one is an owner's act,
+      // not a side effect of a runtime error. The console toggle and MCP
+      // set_active write 'inactive' — this gate once listed only the older
+      // 'disabled'/'deleted' spellings, so a switched-off function stayed live
+      // here while every other surface said it was off.
+      if (isFunctionSwitchedOff(fn.status)) {
         res.status(409).json({
-          error: `Function "${fnName}" is disabled`,
+          error: `Function "${fnName}" is switched off`,
           code: 'FUNCTION_DISABLED',
           hint: 'Re-enable it from the project\'s Functions page, or regenerate it with generate_function.',
         })

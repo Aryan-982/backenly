@@ -23,12 +23,14 @@
  */
 
 import { Worker } from 'worker_threads'
+import { createHash } from 'crypto'
 import * as path from 'path'
 import { prisma } from '@/lib/db'
 import { buildIntegrationContext, IntegrationContext } from './integration-context'
 import { getProviderSpec } from './integration-registry'
 import { generateFixedFunctionCode } from './generator'
 import { isRouteModuleFunction, executeRouteModuleFunction, validateRouteModule } from './route-module-runner'
+import { isFunctionSwitchedOff } from './status'
 import { enforceAiFunctionInvocation, trackAiFunctionInvocation } from '@/lib/entitlements/policy'
 import { recordUsage } from '@/lib/usage/ledger'
 import { accountOf } from '@/lib/usage/account'
@@ -38,6 +40,9 @@ import { isReservedTestEmail } from '@/lib/services/end-user-auth-table'
 // One cast table for the whole codebase. Duplicating it is how the MCP path and
 // this one would drift, and a drifted cast table is invisible until 42804.
 import { castTarget, coerceValue, columnTypes } from '@/lib/mcp/runtime-db'
+
+// Re-exported so the many existing executor importers keep one import site.
+export { FUNCTION_OFF_STATUSES, isFunctionSwitchedOff } from './status'
 
 export interface FunctionEvent {
   type: string
@@ -157,9 +162,10 @@ function buildDbProxy(projectId: string, caller: FunctionCallerContext = {}) {
       if (where && Object.keys(where).length > 0) {
         const keys = Object.keys(where).map(k => k.replace(/[^a-z0-9_]/gi, ''))
         const raw = Object.keys(where)
-        const types = await columnTypes(schemaName, safeName)
+        const types = await columnTypes(projectId, schemaName, safeName)
         const conditions = keys.map((c, i) => `"${c}" = ${dbCast(types.get(c), where[raw[i]], i + 1)}`).join(' AND ')
         return executeWithUserContext<any>(
+          projectId,
           endUserId,
           serviceRole,
           `SELECT * FROM "${schemaName}"."${safeName}" WHERE ${conditions} LIMIT 100`,
@@ -168,6 +174,7 @@ function buildDbProxy(projectId: string, caller: FunctionCallerContext = {}) {
         )
       }
       return executeWithUserContext<any>(
+        projectId,
         endUserId,
         serviceRole,
         `SELECT * FROM "${schemaName}"."${safeName}" LIMIT 100`,
@@ -181,9 +188,10 @@ function buildDbProxy(projectId: string, caller: FunctionCallerContext = {}) {
       const cols = Object.keys(data).filter(c => /^[a-z_][a-z0-9_]*$/i.test(c))
       if (cols.length === 0) throw new Error('No valid columns to insert')
       const colList = cols.map(c => `"${c}"`).join(', ')
-      const types = await columnTypes(schemaName, safeName)
+      const types = await columnTypes(projectId, schemaName, safeName)
       const placeholders = cols.map((c, i) => dbCast(types.get(c), data[c], i + 1)).join(', ')
       const result = await executeWithUserContext<any>(
+        projectId,
         endUserId,
         serviceRole,
         `INSERT INTO "${schemaName}"."${safeName}" (${colList}) VALUES (${placeholders}) RETURNING *`,
@@ -199,10 +207,11 @@ function buildDbProxy(projectId: string, caller: FunctionCallerContext = {}) {
       const whereCols = Object.keys(where).filter(c => /^[a-z_][a-z0-9_]*$/i.test(c))
       if (setCols.length === 0) throw new Error('No valid columns to update')
       if (whereCols.length === 0) throw new Error('WHERE clause required for update')
-      const types = await columnTypes(schemaName, safeName)
+      const types = await columnTypes(projectId, schemaName, safeName)
       const setClause = setCols.map((c, i) => `"${c}" = ${dbCast(types.get(c), data[c], i + 1)}`).join(', ')
       const whereClause = whereCols.map((c, i) => `"${c}" = ${dbCast(types.get(c), where[c], setCols.length + i + 1)}`).join(' AND ')
       return executeWithUserContext<any>(
+        projectId,
         endUserId,
         serviceRole,
         `UPDATE "${schemaName}"."${safeName}" SET ${setClause} WHERE ${whereClause} RETURNING *`,
@@ -218,9 +227,10 @@ function buildDbProxy(projectId: string, caller: FunctionCallerContext = {}) {
       const safeName = table.replace(/[^a-z0-9_]/gi, '')
       const cols = Object.keys(where).filter(c => /^[a-z_][a-z0-9_]*$/i.test(c))
       if (cols.length === 0) throw new Error('WHERE clause required for delete')
-      const types = await columnTypes(schemaName, safeName)
+      const types = await columnTypes(projectId, schemaName, safeName)
       const conditions = cols.map((c, i) => `"${c}" = ${dbCast(types.get(c), where[c], i + 1)}`).join(' AND ')
       await executeWithUserContext<any>(
+        projectId,
         endUserId,
         serviceRole,
         `DELETE FROM "${schemaName}"."${safeName}" WHERE ${conditions}`,
@@ -467,6 +477,54 @@ export function validateSandboxFunction(code: string): Promise<{ valid: boolean;
 
 // ─── Auto-Fix ─────────────────────────────────────────────────────────────────
 
+/**
+ * The one consent check for model rewrites, inside the fixers themselves so
+ * every caller — the executor's fire-and-forget failure paths and the observer
+ * healer — is covered. Agent-deployed code (deploy_code promises "stored
+ * exactly as written") is never model-rewritten: the row keeps its error for
+ * the agent to read and fix. Returns the row when a rewrite is allowed.
+ */
+async function rewritableFunction(functionId: string): Promise<{ codeOrigin: string; name: string } | null> {
+  const row = await prisma.aiFunction.findUnique({
+    where: { id: functionId },
+    select: { codeOrigin: true, name: true },
+  })
+  if (!row) return null
+  if (row.codeOrigin === 'agent') {
+    console.log(`[AutoFix] ${row.name} (${functionId}) is agent-deployed code — left exactly as written, not rewritten.`)
+    return null
+  }
+  return row
+}
+
+/** Every self-heal rewrite leaves an audit row; a silent one is a lie about who wrote the code. */
+async function recordSelfHealRewrite(
+  projectId: string,
+  functionId: string,
+  name: string,
+  errorMessage: string,
+  originalCode: string,
+  fixedCode: string,
+): Promise<void> {
+  const sha = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex')
+  await prisma.auditLog.create({
+    data: {
+      projectId,
+      action: 'AI_FUNCTION_SELF_HEALED',
+      type: 'autonomy',
+      details: JSON.stringify({
+        functionId,
+        name,
+        reason: 'regenerated from a runtime error',
+        error: errorMessage.slice(0, 300),
+        previousCodeSha256: sha(originalCode),
+        newCodeSha256: sha(fixedCode),
+      }),
+      timestamp: new Date(),
+    },
+  }).catch(() => {})
+}
+
 async function autoFixAiFunction(
   functionId: string,
   projectId: string,
@@ -477,6 +535,8 @@ async function autoFixAiFunction(
   triggerTable: string | null
 ): Promise<void> {
   try {
+    const row = await rewritableFunction(functionId)
+    if (!row) return
     console.log(`[AutoFix] Attempting fix for function ${functionId}: ${errorMessage}`)
 
     const fixedCode = await generateFixedFunctionCode(
@@ -500,6 +560,7 @@ async function autoFixAiFunction(
       where: { id: functionId },
       data: { generatedCode: fixedCode, status: 'active', lastError: null },
     })
+    await recordSelfHealRewrite(projectId, functionId, row.name, errorMessage, originalCode, fixedCode)
 
     console.log(`[AutoFix] Successfully fixed function ${functionId}`)
   } catch (err: any) {
@@ -527,6 +588,8 @@ export async function autoFixRouteModuleFunction(
   triggerTableHint: string | null
 ): Promise<boolean> {
   try {
+    const row = await rewritableFunction(functionId)
+    if (!row) return false
     console.log(`[AutoFix:RouteModule] Attempting fix for function ${functionId}: ${errorMessage}`)
     const method = triggerTableHint?.match(/^\s*(GET|POST|PUT|PATCH|DELETE)\b/i)?.[1]?.toUpperCase() || 'POST'
     const { generateFixedRouteModule } = await import('@/lib/ai/function-generator')
@@ -544,6 +607,7 @@ export async function autoFixRouteModuleFunction(
       where: { id: functionId },
       data: { generatedCode: fixedCode, status: 'active', lastError: null },
     })
+    await recordSelfHealRewrite(projectId, functionId, row.name, errorMessage, originalCode, fixedCode)
     console.log(`[AutoFix:RouteModule] Successfully fixed function ${functionId}`)
     return true
   } catch (err: any) {
@@ -629,7 +693,10 @@ export async function healErroredAiFunctions(
           result.restored++
           continue
         }
-        if (!lastError.startsWith('AUTO-FIX') && llmBudget > 0) {
+        // Agent-deployed code is never model-rewritten (the restore path above
+        // is fine — it brings back the agent's own bytes). The error stays for
+        // the agent to read and fix.
+        if (fn.codeOrigin !== 'agent' && !lastError.startsWith('AUTO-FIX') && llmBudget > 0) {
           llmBudget--
           const ok = await autoFixRouteModuleFunction(
             fn.id, projectId, lastError || check.error || 'unknown error',
@@ -643,7 +710,7 @@ export async function healErroredAiFunctions(
 
       // Sandbox function — reuse the NL auto-fixer (validated by re-parse in
       // the generator path; runtime re-verification happens on next fire).
-      if (!lastError.startsWith('AUTO-FIX') && llmBudget > 0) {
+      if (fn.codeOrigin !== 'agent' && !lastError.startsWith('AUTO-FIX') && llmBudget > 0) {
         llmBudget--
         await autoFixAiFunction(
           fn.id, projectId, lastError, fn.generatedCode,
@@ -672,13 +739,8 @@ export async function executeAiFunction(
 
   const fn = await prisma.aiFunction.findFirst({ where: { id: functionId, projectId } })
   if (!fn) return { success: false, logs: [], error: 'Function not found', errorCode: 'NOT_FOUND', durationMs: 0 }
-  // Only a DELIBERATE disable refuses execution. `status: 'error'` records how
-  // the last run went, and this used to treat it as a deployment state — so one
-  // throw made the function permanently uncallable, and the only thing that
-  // clears 'error' is a successful run. See the longer note in
-  // server/routes/dynamic.ts.
-  if (fn.status === 'disabled' || fn.status === 'deleted') {
-    return { success: false, logs: [], error: 'Function is disabled', errorCode: 'NOT_FOUND', durationMs: 0 }
+  if (isFunctionSwitchedOff(fn.status)) {
+    return { success: false, logs: [], error: 'Function is switched off', errorCode: 'NOT_FOUND', durationMs: 0 }
   }
 
   // ── Plan-driven quota ────────────────────────────────────────────────────
