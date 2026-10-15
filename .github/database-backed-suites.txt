@@ -48,6 +48,7 @@ tests/integration/function-create-truthful.spec.ts
 tests/integration/function-selfheal-consent.spec.ts
 tests/integration/function-egress-guard.spec.ts
 tests/integration/function-row-events-data-plane.spec.ts
+tests/integration/project-route-response-shape.spec.ts
 tests/integration/postgres-admin.spec.ts
 
 # Needs a real Postgres AND a git worktree of an older release.
