@@ -61,6 +61,7 @@ const POLITE_BUILD_REQUEST =
 export function looksLikeBuildDescription(message: string): boolean {
   const text = (message ?? '').trim()
   if (text.length < 20) return false // "hi", "help", "yo" — not a description
+
   const words = text.split(/\s+/).filter(Boolean)
   if (words.length < 4) return false
 
@@ -69,11 +70,11 @@ export function looksLikeBuildDescription(message: string): boolean {
 
   // An information-seeking question ("how do I...?", "what is the difference
   // between...?") is a QUESTION/CHAT at any length.
-  if (endsWithQuestionMark && INFO_QUESTION_OPENERS.has(firstWord)) return false
+  if (endsWithQuestionMark && INFO_QUESTION_OPENERS.has(firstWord)) {
+    return false
+  }
 
-  // A short message that is purely a question ("what can you do?", "how does
-  // this work?") is a CHAT/QUESTION the classifier normally catches; if it
-  // still landed here, it is not a build description. Polite build requests
+  // Short questions are not build descriptions. Polite build requests
   // ("Can you build me a recipe app...?") are exempt.
   if (
     text.length < 60 &&
