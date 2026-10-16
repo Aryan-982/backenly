@@ -9,9 +9,43 @@
 /** Question-opener words — a short message starting with one of these is a
  *  QUESTION/CHAT, not a description of an app to build. */
 const QUESTION_OPENERS = new Set([
-  'what', 'how', 'why', 'who', 'when', 'where',
-  'can', 'does', 'do', 'is', 'are', 'should', 'could', 'would', 'will',
+  'what',
+  'how',
+  'why',
+  'who',
+  'when',
+  'where',
+  'can',
+  'does',
+  'do',
+  'is',
+  'are',
+  'should',
+  'could',
+  'would',
+  'will',
 ])
+
+/** Openers that mark an information-seeking question at ANY length when the
+ *  message ends in "?". Deliberately excludes can/could/would/will: those are
+ *  often polite build requests ("Can you build me a recipe app...?"). */
+const INFO_QUESTION_OPENERS = new Set([
+  'what',
+  'how',
+  'why',
+  'who',
+  'when',
+  'where',
+  'does',
+  'do',
+  'is',
+  'are',
+  'should',
+])
+
+/** A build request phrased as a question: "Can you (please) build me ...". */
+const POLITE_BUILD_REQUEST =
+  /^(can|could|would|will)\s+you\s+(please\s+)?(build|create|make|design|develop|generate|write|set up)\b/i
 
 /**
  * Does this message read like a description of an app/product to build?
@@ -30,11 +64,24 @@ export function looksLikeBuildDescription(message: string): boolean {
   const words = text.split(/\s+/).filter(Boolean)
   if (words.length < 4) return false
 
+  const firstWord = words[0].toLowerCase().replace(/[^a-z]/g, '')
+  const endsWithQuestionMark = text.endsWith('?')
+
+  // An information-seeking question ("how do I...?", "what is the difference
+  // between...?") is a QUESTION/CHAT at any length.
+  if (endsWithQuestionMark && INFO_QUESTION_OPENERS.has(firstWord)) return false
+
   // A short message that is purely a question ("what can you do?", "how does
   // this work?") is a CHAT/QUESTION the classifier normally catches; if it
-  // still landed here, it is not a build description.
-  const firstWord = words[0].toLowerCase().replace(/[^a-z]/g, '')
-  if (text.length < 60 && (text.endsWith('?') || QUESTION_OPENERS.has(firstWord))) return false
+  // still landed here, it is not a build description. Polite build requests
+  // ("Can you build me a recipe app...?") are exempt.
+  if (
+    text.length < 60 &&
+    (endsWithQuestionMark || QUESTION_OPENERS.has(firstWord)) &&
+    !POLITE_BUILD_REQUEST.test(text)
+  ) {
+    return false
+  }
 
   // Anything else on a fresh project that is a real sentence is worth handing
   // to the architect — it decides buildable vs genuinely-vague, not us.
