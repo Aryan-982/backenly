@@ -18,6 +18,9 @@
  *                      receiver's words stay in the region
  *   function errors    the row keeps the platform's own prefix, which the
  *                      self-heal guards read, and none of the text
+ *   backfills          a maintenance backfill's batches run in the region, with
+ *                      the cursor (a natural key is a customer's value) kept
+ *                      there and the platform's own sentence on a failure
  *   retention          the region prunes 30 days after the last change; home
  *                      has nothing there to prune
  *
@@ -31,10 +34,28 @@ import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { Client } from 'pg'
 
+// The summarizer's one model call, answered here: what it says is the
+// property, not which model says it. Everything else in the module is real.
+const mockGenerate = jest.fn()
+jest.mock('@/lib/ai/llm', () => ({
+  ...jest.requireActual('@/lib/ai/llm'),
+  generate: (...args: unknown[]) => mockGenerate(...args),
+}))
+// A regional bucket's client signs with its task role's credentials, which a test
+// has none of, so the stored-file tests' presigned links are stubbed.
+jest.mock('@aws-sdk/s3-request-presigner', () => ({ getSignedUrl: async () => 'https://presigned.example.test/object' }))
+
 import { prisma } from '@/lib/db'
+import { loadHistory, saveMessages } from '@/app/api/ai/chat/pipeline/conversation-store'
+import { MESSAGE_KEPT_IN_REGION, createConversationMessage, deleteConversationMessages } from '@/lib/ai/conversation-content'
+import { maybeSummarizeConversation } from '@/lib/ai/conversation-summarizer'
 import { disconnectRegionalClients } from '@/lib/data-plane/regional'
 import { fireTriggers, listDeliveryLogs, replayDelivery, withoutReply } from '@/lib/services/trigger-service'
 import { failureWithoutReply, pruneRegionalBodies } from '@/lib/data-plane/regional-bodies'
+import { CURSOR_NOT_KEPT, queueBackfillJob, type BackfillJobPayload } from '@/lib/autonomy/maintenance/primitives/backfill-job'
+import { inspectBackgroundJob } from '@/lib/autonomy/maintenance/execute'
+import { processRegionalJobs } from '@/lib/queue/worker'
+import { executeAction } from '@/lib/ai/minimal-executor'
 import {
   ERROR_KEPT_IN_REGION,
   deleteFunctionRuns,
@@ -520,6 +541,317 @@ describe('deleting a regional project', () => {
   })
 })
 
+// ── Conversations ────────────────────────────────────────────────────────────
+
+describe("the agent's conversation", () => {
+  const EMAIL = `alice-${randomBytes(3).toString('hex')}@example.com`
+  const conversationRows = (projectId: string) =>
+    prisma.conversationMessage.findMany({ where: { projectId }, orderBy: { messageSeq: 'asc' } })
+
+  afterEach(async () => {
+    await prisma.conversationMessage.deleteMany({ where: { projectId: { in: [homeProject, regionalProject] } } })
+    await run(regionalUrl, `DELETE FROM public.regional_bodies WHERE "kind" = 'conversation_message'`)
+    mockGenerate.mockReset()
+  })
+
+  it("keeps a regional project's words in the region, and reads them back from there", async () => {
+    await saveMessages(regionalProject, `Block ${EMAIL}`, `Blocked ${EMAIL}.`, randomUUID())
+
+    const rows = await conversationRows(regionalProject)
+    expect(rows.map((row) => [row.role, row.content])).toEqual([
+      ['user', MESSAGE_KEPT_IN_REGION],
+      ['ai', MESSAGE_KEPT_IN_REGION],
+    ])
+    expect((await regionalBodyOf('conversation_message', rows[0].id))?.payload).toEqual({ content: `Block ${EMAIL}` })
+    expect((await regionalBodyOf('conversation_message', rows[1].id))?.payload).toEqual({ content: `Blocked ${EMAIL}.` })
+    const [mentions] = await rowsIn<{ n: string }>(
+      homeUrl(),
+      `SELECT count(*)::text AS n FROM conversation_messages WHERE content LIKE $1 OR metadata::text LIKE $1`,
+      [`%${EMAIL}%`],
+    )
+    expect(mentions.n).toBe('0')
+
+    const { history } = await loadHistory(regionalProject)
+    expect(history).toEqual([
+      { role: 'user', content: `Block ${EMAIL}` },
+      { role: 'assistant', content: `Blocked ${EMAIL}.` },
+    ])
+  })
+
+  it("keeps a home project's words on the row, as before", async () => {
+    await saveMessages(homeProject, `Block ${EMAIL}`, `Blocked ${EMAIL}.`, randomUUID())
+    expect((await conversationRows(homeProject)).map((row) => row.content)).toEqual([`Block ${EMAIL}`, `Blocked ${EMAIL}.`])
+    expect((await loadHistory(homeProject)).history.map((turn) => turn.content)).toEqual([`Block ${EMAIL}`, `Blocked ${EMAIL}.`])
+  })
+
+  // Written directly, not through saveMessages, so no background summary runs
+  // alongside the one each test calls for.
+  async function conversationOf(projectId: string, turns: number, ask: (i: number) => string): Promise<void> {
+    for (let i = 0; i < turns; i++) {
+      await createConversationMessage({ projectId, role: 'user', content: ask(i) })
+      await createConversationMessage({ projectId, role: 'ai', content: `answer ${i}` })
+    }
+  }
+
+  it('makes the summary from the words in the region, and keeps it there', async () => {
+    await conversationOf(regionalProject, 11, (i) => `question ${i} from ${EMAIL}`)
+    mockGenerate.mockResolvedValue({
+      json: { builtSoFar: ['notes table'], decisions: [], userPreferences: [], currentFocus: `notes for ${EMAIL}` },
+    })
+
+    await maybeSummarizeConversation(regionalProject)
+
+    // The model was shown the conversation itself, read from the region.
+    expect(mockGenerate).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(mockGenerate.mock.calls[0])).toContain(`question 10 from ${EMAIL}`)
+    const summary = await prisma.conversationMessage.findFirst({ where: { projectId: regionalProject, role: 'summary' } })
+    expect(summary?.content).toBe(MESSAGE_KEPT_IN_REGION)
+    expect(JSON.stringify((await regionalBodyOf('conversation_message', summary!.id))?.payload)).toContain(`notes for ${EMAIL}`)
+    expect((await loadHistory(regionalProject)).summaryContext).toContain(`notes for ${EMAIL}`)
+  })
+
+  it('makes no summary, and loads no history, while the region cannot be read', async () => {
+    await conversationOf(regionalProject, 11, (i) => `question ${i}`)
+    delete process.env[REGION_VARIABLE]
+    try {
+      await expect(maybeSummarizeConversation(regionalProject)).rejects.toMatchObject({ code: 'REGION_NOT_CONFIGURED' })
+      expect(await loadHistory(regionalProject)).toEqual({ history: [], summaryContext: '' })
+    } finally {
+      process.env[REGION_VARIABLE] = regionalUrl
+    }
+    expect(mockGenerate).not.toHaveBeenCalled()
+    expect(await prisma.conversationMessage.count({ where: { projectId: regionalProject, role: 'summary' } })).toBe(0)
+  })
+
+  it('deletes the words in the region with their messages', async () => {
+    await saveMessages(regionalProject, 'to be deleted', 'gone', randomUUID())
+    const ids = (await conversationRows(regionalProject)).map((row) => row.id)
+
+    expect(await deleteConversationMessages(regionalProject, {})).toBe(2)
+
+    for (const id of ids) expect(await regionalBodyOf('conversation_message', id)).toBeUndefined()
+  })
+})
+
+// ── Maintenance backfills ────────────────────────────────────────────────────
+
+describe('a maintenance backfill', () => {
+  // A natural primary key: every cursor a batch leaves is a customer's own email.
+  const EMAILS = ['ann@example.com', 'ben@example.com', 'cal@example.com']
+  const schema = () => `workspace_${regionalProject}`
+  const payload = (table: string, idempotencyKey: string): BackfillJobPayload => ({
+    projectId: regionalProject,
+    planVersion: 'v1',
+    idempotencyKey,
+    table,
+    sourceColumn: 'status',
+    targetColumn: 'state',
+    transform: { kind: 'upper' },
+    batchRows: 1,
+    cursor: null,
+  })
+  /** What the region's own scheduler runs, until nothing more is due. */
+  async function runRegionUntilIdle(): Promise<number> {
+    let processed = 0
+    for (let i = 0; i < 10; i++) {
+      const pass = await processRegionalJobs('us-east-1')
+      if (pass.processed === 0) break
+      processed += pass.processed
+    }
+    return processed
+  }
+
+  beforeAll(async () => {
+    await run(
+      regionalUrl,
+      `CREATE SCHEMA IF NOT EXISTS "${schema()}";
+       CREATE TABLE "${schema()}".accounts (email text PRIMARY KEY, status text, state text);
+       INSERT INTO "${schema()}".accounts (email, status) VALUES ${EMAILS.map((e) => `('${e}', 'active')`).join(', ')};
+       CREATE TABLE "${schema()}".tallies (email text PRIMARY KEY, status text, state int);
+       INSERT INTO "${schema()}".tallies (email, status) VALUES ('${EMAILS[0]}', '${EMAILS[0]}')`,
+    )
+  })
+
+  afterAll(async () => {
+    await run(regionalUrl, `DROP TABLE IF EXISTS "${schema()}".accounts, "${schema()}".tallies`).catch(() => {})
+    await run(regionalUrl, `DELETE FROM public.regional_bodies WHERE "kind" = 'backfill_cursor'`).catch(() => {})
+    await prisma.backgroundJob.deleteMany({ where: { projectId: regionalProject } }).catch(() => {})
+  })
+
+  it('runs its batches in the region, with each cursor kept there and none on the platform rows', async () => {
+    const idempotencyKey = `bf-${randomUUID()}`
+    const first = await queueBackfillJob(payload('accounts', idempotencyKey))
+    // A regional job, so no home queue ever claims it.
+    expect(await prisma.backgroundJob.findUniqueOrThrow({ where: { id: first.id } })).toMatchObject({
+      status: 'regional_pending',
+      payload: expect.objectContaining({ region: 'us-east-1', cursor: null }),
+    })
+
+    // Three rows one at a time, then the batch that finds the end.
+    expect(await runRegionUntilIdle()).toBe(4)
+
+    const chain = await prisma.backgroundJob.findMany({
+      where: { projectId: regionalProject, type: 'maintenance_backfill', payload: { path: ['idempotencyKey'], equals: idempotencyKey } },
+    })
+    expect(chain.map((job) => job.status)).toEqual(['completed', 'completed', 'completed', 'completed'])
+    expect(JSON.stringify(chain.map((job) => [job.payload, job.result, job.error]))).not.toMatch(/example\.com/)
+    const kept = await rowsIn<{ cursor: string }>(
+      regionalUrl,
+      `SELECT payload->>'cursor' AS cursor FROM public.regional_bodies WHERE "kind" = 'backfill_cursor' AND "projectId" = $1 ORDER BY 1`,
+      [regionalProject],
+    )
+    expect(kept.map((k) => k.cursor)).toEqual(EMAILS)
+    expect(await rowsIn(regionalUrl, `SELECT state FROM "${schema()}".accounts ORDER BY email`)).toEqual(EMAILS.map(() => ({ state: 'ACTIVE' })))
+
+    // The ladder reads the chain as finished.
+    expect(await inspectBackgroundJob(first.id, { projectId: regionalProject, idempotencyKey })).toEqual({
+      state: 'done',
+      detail: 'backfill complete: 3 row(s) updated over 4 batch(es)',
+    })
+  })
+
+  it('records the platform’s own sentence when a batch fails, never the database’s words', async () => {
+    const first = await queueBackfillJob(payload('tallies', `bf-${randomUUID()}`))
+    expect(await runRegionUntilIdle()).toBe(1)
+    const job = await prisma.backgroundJob.findUniqueOrThrow({ where: { id: first.id } })
+    // Retried after its backoff; the reason is in the region's own logs.
+    expect(job).toMatchObject({
+      status: 'regional_pending',
+      attempts: 1,
+      error: "The backfill batch did not complete in us-east-1. The reason is in that region's logs.",
+    })
+    expect(JSON.stringify([job.payload, job.result, job.error])).not.toMatch(/example\.com/i)
+    // Due again in five seconds; out of the way of the tests below.
+    await prisma.backgroundJob.delete({ where: { id: first.id } })
+  })
+
+  it('refuses, and ends its chain, when its region no longer keeps where it stopped', async () => {
+    const idempotencyKey = `bf-${randomUUID()}`
+    await queueBackfillJob({ ...payload('accounts', idempotencyKey), cursor: EMAILS[0], batches: 1 })
+    await run(regionalUrl, `DELETE FROM public.regional_bodies WHERE "kind" = 'backfill_cursor'`)
+    expect(await runRegionUntilIdle()).toBe(1)
+    const [job] = await prisma.backgroundJob.findMany({
+      where: { projectId: regionalProject, payload: { path: ['idempotencyKey'], equals: idempotencyKey } },
+    })
+    expect(job).toMatchObject({ status: 'completed', result: expect.objectContaining({ refusal: CURSOR_NOT_KEPT, cursor: null }) })
+  })
+
+  it('waits, unclaimed, while its project is paused', async () => {
+    await prisma.project.update({ where: { id: regionalProject }, data: { pausedAt: new Date() } })
+    let firstId = ''
+    try {
+      firstId = (await queueBackfillJob(payload('accounts', `bf-${randomUUID()}`))).id
+      expect(await runRegionUntilIdle()).toBe(0)
+      expect(await prisma.backgroundJob.findUniqueOrThrow({ where: { id: firstId } })).toMatchObject({
+        status: 'regional_pending',
+        attempts: 0,
+      })
+    } finally {
+      await prisma.project.update({ where: { id: regionalProject }, data: { pausedAt: null } })
+    }
+    expect(await runRegionUntilIdle()).toBeGreaterThan(0)
+    expect((await prisma.backgroundJob.findUniqueOrThrow({ where: { id: firstId } })).status).toBe('completed')
+  })
+})
+
+// ── Stored files ─────────────────────────────────────────────────────────────
+
+describe('a stored file', () => {
+  // An end user's own words, in its name.
+  const NAME = `passport-${randomBytes(3).toString('hex')}-jane.pdf`
+  const PDF = () => ({ name: NAME, buffer: Buffer.from('%PDF-1.4 fixture'), mimeType: 'application/pdf' })
+  const ENV: Record<string, string> = {
+    STORAGE_S3_BUCKET: 'home-files-test',
+    STORAGE_S3_REGION: 'ap-south-1',
+    STORAGE_S3_ACCESS_KEY: 'files-suite-not-a-real-key',
+    STORAGE_S3_SECRET_KEY: 'files-suite-not-a-real-secret',
+    STORAGE_S3_BUCKET_US_EAST_1: 'virginia-files-test',
+  }
+  const saved: Record<string, string | undefined> = {}
+  let send: jest.SpyInstance
+  let svc: any
+  let bucketId = ''
+  let homeBucketId = ''
+  let fileId = ''
+  const rowText = (row: { name: string; originalName: string; path: string; metadata: unknown }) =>
+    [row.name, row.originalName, row.path, JSON.stringify(row.metadata ?? null)].join(' ')
+
+  beforeAll(async () => {
+    for (const [k, v] of Object.entries(ENV)) {
+      saved[k] = process.env[k]
+      process.env[k] = v
+    }
+    // The bytes go nowhere: what is under test is what the rows and the region keep.
+    const { S3Client } = await import('@aws-sdk/client-s3')
+    send = jest.spyOn(S3Client.prototype, 'send').mockResolvedValue({} as never)
+    const { S3StorageService } = await import('@/lib/services/s3Storage')
+    svc = new S3StorageService()
+    bucketId = (
+      await prisma.storageBucket.create({ data: { name: 'uploads', projectId: regionalProject, overwriteStrategy: 'deny' }, select: { id: true } })
+    ).id
+    homeBucketId = (await prisma.storageBucket.create({ data: { name: 'uploads', projectId: homeProject }, select: { id: true } })).id
+  })
+
+  afterAll(async () => {
+    send.mockRestore()
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+    await prisma.storageFile.deleteMany({ where: { projectId: { in: [regionalProject, homeProject] } } })
+    await prisma.storageBucket.deleteMany({ where: { projectId: { in: [regionalProject, homeProject] } } })
+    await run(regionalUrl, `DELETE FROM public.regional_bodies WHERE "kind" = 'storage_file'`)
+  })
+
+  it('keeps a regional file’s name in the region, and shows and finds it from there', async () => {
+    const stored = await svc.uploadFile(bucketId, PDF(), { projectId: regionalProject })
+    fileId = stored.id
+    expect(stored.name).toBe(NAME)
+
+    const row = await prisma.storageFile.findUniqueOrThrow({ where: { id: fileId } })
+    expect(row.name).toMatch(/^f_[A-Za-z0-9_-]{32}\.pdf$/)
+    expect(rowText(row)).not.toMatch(/jane|passport/)
+    expect((await regionalBodyOf('storage_file', fileId))?.payload).toEqual({ name: NAME, originalName: NAME })
+    const [mentions] = await rowsIn<{ n: string }>(
+      homeUrl(),
+      `SELECT count(*)::text AS n FROM storage_files WHERE name LIKE $1 OR "originalName" LIKE $1 OR path LIKE $1`,
+      ['%jane%'],
+    )
+    expect(mentions.n).toBe('0')
+
+    expect((await svc.listFiles(bucketId, regionalProject, {})).map((f: { name: string }) => f.name)).toEqual([NAME])
+    expect((await svc.listFiles(bucketId, regionalProject, { search: 'JANE' })).map((f: { id: string }) => f.id)).toEqual([fileId])
+    expect(await svc.countFiles(bucketId, regionalProject, 'jane')).toBe(1)
+    expect(await svc.countFiles(bucketId, regionalProject, 'nobody')).toBe(0)
+
+    // The agent sees the same names, and finds a file by its name.
+    const listed: any = await executeAction(
+      { action: 'LIST_FILES', params: { bucketName: 'uploads', search: 'jane' } } as any,
+      regionalProject,
+      undefined,
+      0,
+      undefined,
+      false,
+    )
+    expect(listed.data.files.map((f: { name: string }) => f.name)).toEqual([NAME])
+  })
+
+  it('still refuses a second file of the same name in a bucket that denies overwrites', async () => {
+    await expect(svc.uploadFile(bucketId, PDF(), { projectId: regionalProject })).rejects.toMatchObject({ code: 'FILE_EXISTS' })
+  })
+
+  it('keeps a home file’s name on its row, as before', async () => {
+    const stored = await svc.uploadFile(homeBucketId, PDF(), { projectId: homeProject })
+    expect((await prisma.storageFile.findUniqueOrThrow({ where: { id: stored.id } })).name).toBe(NAME)
+    expect(await regionalBodyOf('storage_file', stored.id)).toBeUndefined()
+  })
+
+  it('forgets a regional file’s name when the file is deleted for good', async () => {
+    await svc.permanentlyDeleteFile(fileId, regionalProject)
+    expect(await regionalBodyOf('storage_file', fileId)).toBeUndefined()
+  })
+})
+
 // ── Retention ────────────────────────────────────────────────────────────────
 
 describe('retention', () => {
@@ -537,6 +869,21 @@ describe('retention', () => {
     expect(await regionalBody(old)).toBeUndefined()
     expect(await regionalBody(fresh)).toBeDefined()
     expect(await pruneRegionalBodies('ap-south-1')).toBe(0)
+  })
+
+  it("keeps a conversation's words past 30 days: they last as long as the messages", async () => {
+    const words = randomUUID()
+    await run(
+      regionalUrl,
+      `INSERT INTO public.regional_bodies ("id", "kind", "projectId", "payload", "createdAt", "updatedAt")
+       VALUES ('${words}', 'conversation_message', '${regionalProject}', '{"content":"old words"}'::jsonb,
+               now() - interval '400 days', now() - interval '400 days')`,
+    )
+
+    await pruneRegionalBodies('us-east-1')
+
+    expect(await regionalBodyOf('conversation_message', words)).toBeDefined()
+    await run(regionalUrl, `DELETE FROM public.regional_bodies WHERE "id" = '${words}'`)
   })
 })
 

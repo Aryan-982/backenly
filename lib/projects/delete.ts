@@ -69,6 +69,7 @@ import { functionRoleName } from '@/lib/services/ai-functions/function-db-role'
 import { purgeProjectExternals } from '@/lib/projects/purge'
 import { PURGE_JOB_TYPE, PURGE_STATUS } from '@/lib/queue'
 import { purgeAccountState } from '@/lib/usage/account'
+import { confirmPropagation, type Propagation } from '@/lib/auth-projection/confirm'
 
 export { PURGE_JOB_TYPE, PURGE_STATUS }
 
@@ -114,6 +115,12 @@ export interface DeletionResult {
   purgeJobIds: string[]
   /** False when the post-commit purge attempt failed and was left to the worker. */
   externalPurgeCompleted: boolean
+  /**
+   * Whether the project's region has the deletion yet, for a single project
+   * kept outside the home region (lib/auth-projection/confirm.ts). Unset for an
+   * account deletion, whose projects' deletions are delivered all the same.
+   */
+  propagation?: Propagation
 }
 
 type Tx = Prisma.TransactionClient
@@ -184,6 +191,14 @@ const SWEEP_EXCLUDED: Record<string, string> = {
   UsageMetric: 'billing ledger',
   // Platform telemetry about Backenly itself, not customer content.
   ProductEvent: 'platform telemetry',
+  // The deletion itself, on its way to the project's region. The delete
+  // trigger records it in this same transaction, and the region removes the
+  // project and its keys from its authorization copy only when this row is
+  // delivered (lib/auth-projection/deliver.ts). Swept here, the region would
+  // never hear of the deletion while its copy stayed fresh, and the deleted
+  // project's keys would keep working there. Delivered rows are pruned a day
+  // later; they hold ids only.
+  AuthProjectionChange: 'carries the deletion to its region',
 }
 
 /** Exported for the deletion test, which seeds and sweeps this exact list. */
@@ -486,12 +501,16 @@ export async function deleteProjectCompletely(projectId: string): Promise<Deleti
   )
 
   const externalPurgeCompleted = await attemptImmediatePurge([{ projectId, jobId, region }])
+  // Its keys stop working in its region once the region has the deletion
+  // (lib/auth-projection/confirm.ts); `pending` says it is still in flight.
+  const propagation = await confirmPropagation({ entity: 'project', entityId: projectId })
 
   return {
     projectIds: [projectId],
     schemasDropped: schemas,
     purgeJobIds: [jobId],
     externalPurgeCompleted,
+    propagation,
   }
 }
 
