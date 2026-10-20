@@ -213,6 +213,7 @@ export interface BrainResult {
   success: boolean
   summary: string
   needsUser: boolean
+  /** Agent-loop model calls that came back with an answer; a turn that skips the loop counts its steps. */
   iterations: number
   toolsRun: string[]
   classification: Classification
@@ -1476,6 +1477,10 @@ async function runAgentLoop(
   /** Set when the loop stopped to protect its verification reserve. */
   let budgetStopped = false
 
+  // Model calls that came back with an answer, which BrainResult.iterations
+  // reports. Not `iter`: every exit but running out of steps is a break, which
+  // skips `iter++`, so a turn the model answered at once reported 0.
+  let modelCalls = 0
   let iter = 0
   agentLoop: for (; iter < MAX_ITERATIONS; iter++) {
     // ── Spend the verification reserve BEFORE it can be taken ────────────────
@@ -1548,6 +1553,7 @@ async function runAgentLoop(
       clearTimeout(reserveTimer)
     }
 
+    modelCalls++
     spend(effectiveTokensOf(reply.model, reply.usage))
 
     const text = textOf(reply.message)
@@ -1847,7 +1853,7 @@ async function runAgentLoop(
     success,
     summary: finalSummary,
     needsUser,
-    iterations: iter,
+    iterations: modelCalls,
     toolsRun,
     classification,
     tokensUsed,
