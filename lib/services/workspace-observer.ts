@@ -13,7 +13,8 @@
  *   2. Captures current live state from PostgreSQL (RLS, FKs, orphan tables,
  *      API drift, webhook health, auth error rate)
  *   3. Classifies each finding as safe-to-auto-fix or risky (needs approval)
- *   4. Executes safe fixes inline
+ *   4. Leaves safe fixes to the repair loop, which applies them as governed
+ *      changes (lib/autonomy/reconciler.ts)
  *   5. Writes HealthFinding records for everything found
  *   6. Sends a PlatformNotification for critical findings
  */
@@ -22,8 +23,7 @@ import { prisma } from '@/lib/db/prisma'
 import { detectSubsystemRecurrence } from '@/lib/autonomy/subsystem-recurrence'
 import { detectIntentDrift } from '@/lib/autonomy/intent-conformance'
 import { probeQueryFailed } from '@/lib/core/drift-detector'
-import { queryWorkspaceSchema, executeInWorkspaceSchema } from './workspaceDatabase'
-import { applyPermissionPolicy } from './workspace-rls'
+import { queryWorkspaceSchema } from './workspaceDatabase'
 import {
   loadOwnershipCatalog,
   inferRlsPlanFromCatalog,
@@ -59,8 +59,9 @@ import { generateFixPlansFromRawFindings, type FixPlan } from '@/lib/core/fix-pl
 import { runBuiltInVerification, type VerificationExecutionResult } from '@/lib/verification/verification-executor'
 import { FLAGS } from '@/lib/config/flags'
 import { watchableProjectsWhere, isWatchableProject } from '@/lib/projects/backend-presence'
-import { skipUnreachable } from '@/lib/autonomy/region-skip'
+import { canReach, skipUnreachable } from '@/lib/autonomy/region-skip'
 import { projectRegion } from '@/lib/data-plane/regional'
+import { partitionServed } from '@/lib/data-plane/serving'
 import { findingDetailsKeptHere } from '@/lib/data-plane/residency'
 import type { CloudRegionId } from '@/lib/regions'
 
@@ -82,6 +83,15 @@ export interface ObserverResult {
   fixPlans?: FixPlan[]
   /** Phase 13 — populated when ENABLE_VERIFICATION_EXECUTION + ENABLE_SAFE_VERIFICATION_MODE are on */
   verificationResult?: VerificationExecutionResult
+  /**
+   * Set when nothing was checked here. `served-elsewhere`: another region's
+   * worker checks and repairs the project on its own schedule. `unreachable`:
+   * this process cannot reach the project's region, and the skip is recorded
+   * (lib/autonomy/region-skip.ts).
+   */
+  skipped?: 'served-elsewhere' | 'unreachable'
+  /** The region whose worker checks the project, when it is served elsewhere. */
+  region?: CloudRegionId
 }
 
 // ─── Main Entry Point ─────────────────────────────────────────────────────────
@@ -364,7 +374,22 @@ export async function runObserverForProject(projectId: string): Promise<Observer
     errors: [],
   }
 
-  // Nothing built means nothing can be wrong. This is the only gate, and it is
+  // A project is checked and repaired only by the region that serves it
+  // (lib/autonomy/region-skip.ts). The scheduled passes keep to their own
+  // projects before they get here, but a mutation's event, the event bus and
+  // the console reach this function for any project, so the rule is kept here,
+  // where every caller passes: nothing here detects or repairs a project
+  // another region serves. One this process cannot reach is skipped and
+  // recorded, as the scheduled passes do.
+  const { served } = await partitionServed([{ id: projectId }])
+  if (served.length === 0) {
+    const region = await projectRegion(projectId)
+    console.log(`[WorkspaceObserver] project=${projectId} is checked by its own region's worker (${region}); nothing was scanned here`)
+    return { ...result, skipped: 'served-elsewhere', region }
+  }
+  if (!(await canReach(projectId, 'observer'))) return { ...result, skipped: 'unreachable' }
+
+  // Nothing built means nothing can be wrong. This gate, like the region's, is
   // here rather than at the callers because five of them reach this function
   // (the dashboard's first-load kick, Re-scan, the event bus, the cron route
   // and the daily sweep) and the one that did not check is the one that
@@ -472,63 +497,29 @@ async function observeProject(projectId: string, result: ObserverResult): Promis
     if (finding.severity === 'critical') result.critical++
 
     let status: FindingStatus
-    let autoFixed = false
-    let fixAppliedAt: Date | undefined
 
-    // An inline fix is a mutation of the owner's schema, so it answers to the
-    // same flag and dial as every other repair. Refused, the finding is still
-    // recorded as detected, with the reason, and nothing is changed.
-    // Imported lazily: desired-state imports this module.
-    const permit =
-      finding.autoFixable && finding.fix
-        ? await (async () => {
-            const [{ permitInlineRepair }, { deriveTier }] = await Promise.all([
-              import('@/lib/authority/gate'),
-              import('@/lib/autonomy/desired-state'),
-            ])
-            return permitInlineRepair(projectId, finding.type, deriveTier(finding.type, finding.details))
-          })()
-        : null
-
-    if (finding.autoFixable && finding.fix && permit && !permit.allowed) {
+    // The observer repairs nothing. Every repair it could make (RLS on an
+    // exposed table, a policy for a deny-all table, an index on a reference
+    // column) is an invariant the repair loop probes with these same detectors
+    // (lib/autonomy/desired-state.ts), and the loop applies it through
+    // runAutoFix: a governed change in the change ledger, under the master flag,
+    // the dial, the circuit breaker and the change freeze during an incident.
+    // Repairing here as well was a second path with none of those. The settled
+    // pass a minute after a build created an index while the loop was frozen
+    // for an incident, the index was in no change record, and restoring the
+    // build was then refused because its table had changed since.
+    //
+    // So the finding stays open for the loop, and when the flags or the dial
+    // hold the repair back it says why. Imported lazily: desired-state imports
+    // this module.
+    if (finding.autoFixable) {
+      const [{ repairRefusal }, { deriveTier }] = await Promise.all([
+        import('@/lib/authority/gate'),
+        import('@/lib/autonomy/desired-state'),
+      ])
       status = 'open'
-      finding.details = { ...finding.details, notAppliedBecause: permit.reason }
-    } else if (finding.autoFixable && finding.fix) {
-      try {
-        await finding.fix()
-        // The repair returning is not proof it worked. Re-check the specific
-        // gap against the live database, the same rule every other repair path
-        // follows: 'resolved' is a verified fix, 'unresolved' is not a fix at
-        // all, and anything else is a repair that ran without confirmation.
-        const { recheckGap } = await import('@/lib/autonomy/desired-state')
-        const recheck = await recheckGap(
-          projectId,
-          finding.type,
-          finding.details as Record<string, unknown>,
-        ).catch(() => 'unknown' as const)
-        if (recheck === 'unresolved') {
-          status = 'pending_approval'
-          result.pendingApproval++
-          finding.details = {
-            ...finding.details,
-            fixError: 'The repair ran, but the problem is still present on re-check.',
-          }
-        } else {
-          status = 'auto_fixed'
-          autoFixed = true
-          fixAppliedAt = new Date()
-          result.autoFixed++
-          finding.details = {
-            ...finding.details,
-            verification: recheck === 'resolved' ? 'confirmed' : 'unverified',
-          }
-        }
-      } catch (err: any) {
-        // Fix failed — demote to pending_approval so a human can review
-        status = 'pending_approval'
-        result.pendingApproval++
-        finding.details.fixError = err?.message ?? String(err)
-      }
+      const refusal = await repairRefusal(projectId, deriveTier(finding.type, finding.details))
+      if (refusal) finding.details = { ...finding.details, notAppliedBecause: refusal }
     } else if (finding.autoFixable === false) {
       status = 'pending_approval'
       result.pendingApproval++
@@ -536,8 +527,8 @@ async function observeProject(projectId: string, result: ObserverResult): Promis
       status = 'open'
     }
 
-    const written = await writeFinding(projectId, finding, status, autoFixed, fixAppliedAt)
-    if (finding.severity === 'critical' && status !== 'auto_fixed') {
+    const written = await writeFinding(projectId, finding, status, false)
+    if (finding.severity === 'critical') {
       outstandingCritical.push({ finding, firstDetectedAt: written.firstDetectedAt })
     }
   }
@@ -679,8 +670,9 @@ async function observeProject(projectId: string, result: ObserverResult): Promis
     }
   } catch { /* best-effort — a failed heal must never fail the scan */ }
 
-  // Tell the owner about criticals that are still theirs to deal with. Counted
-  // AFTER the fix attempts: a critical this pass repaired is not news.
+  // Tell the owner about criticals that are still theirs to deal with. Only
+  // those first seen CRITICAL_ALERT_CONFIRM_MS ago are sent, and by then the
+  // repair loop, which runs every minute, has repaired any it is allowed to.
   if (outstandingCritical.length > 0) {
     await notifyCritical(projectId, outstandingCritical)
   }
@@ -1191,7 +1183,7 @@ export async function detectMissingRls(projectId: string): Promise<RawFinding[]>
         schemaName,
         reason: exposureReason(tableName, plan),
         // Carried so the approve modal, the agent journal and buildFixAction all
-        // describe the SAME repair the fix closure will actually run.
+        // describe the SAME repair the repair loop will actually run.
         rlsTemplate: plan.template,
         rlsBasis: plan.basis,
         rlsRationale: plan.reason,
@@ -1201,12 +1193,8 @@ export async function detectMissingRls(projectId: string): Promise<RawFinding[]>
       // carrying a literal user_id. Still never true for `undecidable`: enabling
       // RLS with no derivable policy makes the table read EMPTY, replacing a data
       // exposure with an outage. Those go to a human, who decides the rule.
+      // No inline fix: the repair loop applies the policy as a governed change.
       autoFixable: plan.kind !== 'undecidable',
-      fix: plan.kind !== 'undecidable'
-        ? async () => {
-            await applyPermissionPolicy(projectId, { tableName, template: 'auto' })
-          }
-        : undefined,
     }
   })
 }
@@ -1294,18 +1282,8 @@ export async function detectRlsDeniesEverything(projectId: string): Promise<RawF
       // Same rule as missing_rls: repair only when a policy is DERIVABLE.
       // Installing a wrong policy here would replace an outage with a different
       // outage, so undecidable ownership goes to the human who knows the intent.
+      // No inline fix: the repair loop installs the policy as a governed change.
       autoFixable: plan.kind !== 'undecidable',
-      fix: plan.kind !== 'undecidable'
-        ? async () => {
-            const result = await applyPermissionPolicy(projectId, { tableName, template: 'auto' })
-            // Never report a repair that did not land — an unfixed default-deny
-            // table that reads as "auto_fixed" is worse than an open finding,
-            // because the queue stops showing it.
-            if (!result.success) {
-              throw new Error(`Could not install a policy on "${tableName}": ${result.message}`)
-            }
-          }
-        : undefined,
     }
   })
 }

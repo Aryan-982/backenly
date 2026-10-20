@@ -1,7 +1,8 @@
+import { randomUUID } from 'crypto'
 import { prisma } from '@/lib/db'
 import { quotesKeptHere } from '@/lib/data-plane/residency'
-import { redactSecretParams } from '@/lib/mcp/withhold-secrets'
-import { sealParams } from '@/lib/operational-memory/sealed-params'
+import { redactSecretParams, withholdSecrets } from '@/lib/mcp/withhold-secrets'
+import { keepHeldAction, storedHeldTarget } from '@/lib/operational-memory/held-action-targets'
 import type { ExecutionChange } from '@/lib/orchestration/atomic-executor'
 import { recordPattern, resolveProjectType, patternTypeForEventType } from '@/lib/patterns/cross-project-learning'
 
@@ -397,7 +398,8 @@ export async function recordBackendExecutionMemory(input: RecordExecutionMemoryI
   )
   // A project kept in another region: what changed, never the request or the
   // intent parsed from it, which can quote its data (lib/data-plane/residency.ts).
-  const request = (await quotesKeptHere(input.projectId)) ? input.userMessage : null
+  // Elsewhere both are kept with credentials withheld (lib/mcp/withhold-secrets.ts).
+  const request = (await quotesKeptHere(input.projectId)) ? withholdSecrets(input.userMessage) : null
 
   const events = []
 
@@ -408,7 +410,7 @@ export async function recordBackendExecutionMemory(input: RecordExecutionMemoryI
     actorId: input.actorId,
     summary: request === null ? 'User asked for a backend change.' : `User asked: "${truncate(request)}"`,
     beforeState: input.beforeState,
-    afterState: request === null ? undefined : input.canonicalIntent,
+    afterState: request === null ? undefined : redactSecretParams(input.canonicalIntent),
     reason: 'Captured as the source requirement for this backend change.',
     riskLevel: 'low',
     status: 'applied',
@@ -489,8 +491,10 @@ export async function recordToolExecutionMemory(input: RecordToolExecutionMemory
   )
   // A project kept in another region: which tools ran, never the request or
   // the agent's result, which can quote its data (lib/data-plane/residency.ts).
+  // Elsewhere both are kept with credentials withheld (lib/mcp/withhold-secrets.ts).
   const quote = await quotesKeptHere(input.projectId)
-  const request = quote ? input.userMessage : null
+  const request = quote ? withholdSecrets(input.userMessage) : null
+  const result = quote && input.summary ? withholdSecrets(input.summary) : undefined
 
   const events = []
   events.push(await createBackendEvent({
@@ -525,7 +529,7 @@ export async function recordToolExecutionMemory(input: RecordToolExecutionMemory
     projectId: input.projectId,
     eventIds: events.map(event => event.id),
     title: receiptTitleForTools(eventfulTools),
-    summary: receiptSummaryForTools(eventfulTools, request, quote ? input.summary : undefined),
+    summary: receiptSummaryForTools(eventfulTools, request, result),
     resourcesChanged: {
       tools: eventfulTools,
       total: eventfulTools.length,
@@ -630,6 +634,9 @@ export async function queuePendingActionFinding(input: QueuePendingActionInput) 
   // it instead of stacking duplicates. Without this, a user repeatedly asking
   // the AI to run a gated action (without ever confirming) would flood both
   // the Review Queue and the Memory timeline with copies of the same request.
+  // A project kept in another region keeps the target there, and its row the
+  // target's stand-in, which finds the same target again.
+  const location = await storedHeldTarget(input.projectId, input.target)
   const duplicate = await prisma.healthFinding.findFirst({
     where: {
       projectId: input.projectId,
@@ -637,7 +644,7 @@ export async function queuePendingActionFinding(input: QueuePendingActionInput) 
       status: 'pending_approval',
       AND: [
         { details: { path: ['executorAction'], equals: input.action } },
-        ...(input.target ? [{ details: { path: ['location'], equals: input.target } }] : []),
+        ...(location ? [{ details: { path: ['location'], equals: location } }] : []),
       ],
     },
     select: { id: true },
@@ -645,16 +652,27 @@ export async function queuePendingActionFinding(input: QueuePendingActionInput) 
 
   if (duplicate) return duplicate
 
+  // The target and arguments are what the approver reads and what approval
+  // replays. They are kept first, under the id the finding then takes: on the
+  // finding at home, and in the region for a project kept in another one,
+  // where the finding keeps the action, its arguments' shape and the target's
+  // stand-in (lib/operational-memory/held-action-targets.ts).
+  const id = randomUUID()
+  const held = await keepHeldAction(input.projectId, id, {
+    actionTitle: capitalize(label),
+    title,
+    target: input.target,
+    params: input.params,
+  })
+
   // Record the "proposed" event FIRST so we can stitch its id onto the finding.
   // That id is the durable link between the Review Queue (HealthFinding) and the
   // Memory timeline (BackendEvent): approving/dismissing the finding later flips
   // this exact event out of the 'proposed' state instead of leaving it stale.
   //
-  // The finding below keeps the target and arguments: they are what the
-  // approver reads, as an approval request keeps its own (founders' residency
-  // table, 2026-10-16). The timeline event is a record of work, redacted at
-  // write for a project kept in another region: the action, never its target,
-  // which can be a file's name or an end user's email (lib/data-plane/residency.ts).
+  // The timeline event is a record of work, redacted at write for a project
+  // kept in another region: the action, never its target, which can be a
+  // file's name or an end user's email (lib/data-plane/residency.ts).
   const quote = await quotesKeptHere(input.projectId)
   let backendEventId: string | null = null
   try {
@@ -678,23 +696,17 @@ export async function queuePendingActionFinding(input: QueuePendingActionInput) 
 
   const finding = await prisma.healthFinding.create({
     data: {
+      id,
       projectId: input.projectId,
       type: 'ai_action_pending',
       severity: input.riskLevel === 'high' ? 'critical' : 'warning',
       status: 'pending_approval',
       autoFixed: false,
       details: {
-        title,
+        ...held,
         description: input.reason,
-        location: input.target,
         source: input.source,
         executorAction: input.action,
-        // Display copy only: secret-named values are redacted because this row
-        // is served (health endpoint, trust report, Review Queue card,
-        // get_autonomy_status — read-only MCP keys included). Approval replays
-        // from the sealed copy, so nothing the agent sent is lost.
-        executorParams: redactSecretParams(input.params),
-        executorParamsSealed: sealParams((input.params ?? {}) as Record<string, unknown>),
         backendEventId,
       } as any,
     },
@@ -729,8 +741,13 @@ export async function resolvePendingActionMemory(input: {
     const details = (input.finding.details ?? {}) as Record<string, unknown>
     const backendEventId =
       typeof details.backendEventId === 'string' ? details.backendEventId : null
+    // A project kept in another region: the action, never the target its title
+    // names, as the held event names it (lib/data-plane/residency.ts).
+    const quote = await quotesKeptHere(input.projectId)
+    const action = typeof details.executorAction === 'string' ? details.executorAction : null
+    const title = typeof details.title === 'string' && details.title ? details.title : null
     const label =
-      (typeof details.title === 'string' && details.title) ||
+      (quote ? title : action && capitalize(action.replace(/_/g, ' ').toLowerCase())) ||
       input.finding.type.replace(/_/g, ' ')
 
     if (backendEventId) {
